@@ -23,7 +23,7 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 from pydantic import BaseModel, Field
 
-from src import analytics, benchmark, quality
+from src import analytics, quality
 from src.data import ROOT, data_card
 from src.grounding import build_quality_package, format_passages, pages_in, strip_unverified_citations
 from src.llm import describe_llm, get_llm, text_of
@@ -94,7 +94,6 @@ def report_node(state: State) -> dict:
         "scope3_by_label": analytics.top_scope3("category", 3),
         "suppliers": analytics.supplier_priority()["suppliers"][:4],
         "quality": [{k: f[k] for k in ("id", "severity", "title")} for f in quality.run_quality_checks()["findings"]],
-        "peers": benchmark.compare_peers()["ratios"],
     }
     prompt = REPORT_PROMPT.format(question=question, facts=json.dumps(facts, indent=1, default=str))
     reply = get_llm().invoke([_system(), HumanMessage(prompt)])

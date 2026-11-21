@@ -7,6 +7,8 @@ used both as LLM tools and by the Streamlit UI.
 
 from __future__ import annotations
 
+import ast
+import operator
 from typing import Literal
 
 import duckdb
@@ -202,3 +204,32 @@ def run_sql(query: str, inv: Inventory | None = None, max_rows: int = 50) -> dic
         con.close()
     return {"row_count": len(df), "truncated": len(df) > max_rows,
             "rows": df.head(max_rows).round(3).astype(object).where(df.head(max_rows).notna(), None).to_dict(orient="records")}
+
+
+# --- Exact arithmetic for the agent: the model never calculates itself ---------------------------
+
+_OPS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.Div: operator.truediv,
+        ast.Pow: operator.pow, ast.USub: operator.neg, ast.UAdd: operator.pos}
+
+
+def calculate(expression: str) -> dict:
+    """Evaluate plain arithmetic (numbers, + - * / ** and parentheses). Anything else is refused."""
+    def ev(node):
+        if isinstance(node, ast.Expression):
+            return ev(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+            return node.value
+        if isinstance(node, ast.BinOp) and type(node.op) in _OPS:
+            left, right = ev(node.left), ev(node.right)
+            if isinstance(node.op, ast.Pow) and abs(right) > 100:
+                raise ValueError("exponent too large")
+            return _OPS[type(node.op)](left, right)
+        if isinstance(node, ast.UnaryOp) and type(node.op) in _OPS:
+            return _OPS[type(node.op)](ev(node.operand))
+        raise ValueError("only numbers, + - * / ** and parentheses are allowed")
+
+    try:
+        result = ev(ast.parse(expression.strip().replace(",", ""), mode="eval"))
+    except (ValueError, SyntaxError, ZeroDivisionError, OverflowError) as e:
+        return {"expression": expression, "error": str(e) or type(e).__name__}
+    return {"expression": expression, "result": round(result, 6) if isinstance(result, float) else result}

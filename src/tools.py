@@ -11,7 +11,7 @@ from typing import Literal
 
 from langchain_core.tools import tool
 
-from src import analytics, benchmark, quality
+from src import analytics, quality
 from src.grounding import build_quality_package
 from src.kb import get_kb
 
@@ -81,16 +81,19 @@ def assess_quality(question: str, scope: Literal["all", "1", "2", "3"] = "all") 
 
 
 @tool
-def compare_with_peers() -> str:
-    """Compare our Scope 1 and 2 (annualised from Q1 2024) with the two peer reports (DocuSign FY25, Shopify 2024):
-    comparison table, ratios, our main drivers, peer targets and trends, and comparability notes with page sources."""
-    return _json(benchmark.compare_peers())
+def calculate(expression: str) -> str:
+    """Exact arithmetic for figures you already have (ratios, sums, shares, unit conversions): + - * / ** and parentheses
+    over plain numbers, e.g. '16790.1 / 449'. Use it instead of calculating yourself, with numbers taken from tool results
+    or retrieved passages."""
+    return _json(analytics.calculate(expression))
 
 
 @tool
 def search_knowledge_base(query: str, source: Literal["all", "ghg_protocol", "peer1", "peer2"] = "all") -> str:
     """Search the GHG Protocol Corporate Standard and the peer reports. Returns passages with document and page number.
-    Use for definitions, methodology, scope classification, and anything about the peer reports' narrative.
+    Use for definitions, methodology and scope classification, and for the peers' figures and narrative: pass
+    source='peer1' (DocuSign) or 'peer2' (Shopify). Peer tables may come back as flattened text: use a figure only if
+    the passage makes clear which row and year it belongs to.
     Write a specific query (e.g. 'business travel scope 3 employee-owned vehicles')."""
     src = {"all": None, "ghg_protocol": "ghg-protocol-revised.pdf", "peer1": "peer1_emissions_report.pdf",
            "peer2": "peer2_emissions_report.pdf"}[source]
@@ -99,4 +102,4 @@ def search_knowledge_base(query: str, source: Literal["all", "ghg_protocol", "pe
 
 
 ALL_TOOLS = [get_emissions_summary, get_breakdown, get_top_scope3, get_supplier_priority, run_sql,
-             run_quality_checks, assess_quality, compare_with_peers, search_knowledge_base]
+             run_quality_checks, assess_quality, calculate, search_knowledge_base]
