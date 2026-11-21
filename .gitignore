@@ -221,3 +221,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project
+.chroma/
+data/derived/peer2_pages/
+.DS_Store
+
+# Audit traces (one JSON per question)
+traces/
+
+data/
