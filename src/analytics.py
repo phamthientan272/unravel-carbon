@@ -75,15 +75,15 @@ def top_scope3(by: Literal["category", "activity", "reclassified_category"] = "c
                inv: Inventory | None = None) -> dict:
     """Rank Scope 3 emissions three ways.
 
-    - category: as labelled in the data (unreliable, labels are inconsistent)
+    - category: as labelled in the data (the client's reported view; labels are inconsistent)
     - activity: by activity_description
-    - reclassified_category: activities mapped to their correct GHG Protocol category
+    - reclassified_category: activities mapped to an LLM-inferred GHG Protocol category (unverified, indicative)
     Each group lists its top contributing activities and suppliers.
     """
     inv = inv or get_inventory()
     s3 = inv.scope3
     key = {"category": ["category_num", "category_name"], "activity": ["activity_description"],
-           "reclassified_category": ["expected_category_num", "expected_category_name"]}[by]
+           "reclassified_category": ["inferred_category_num", "inferred_category_name"]}[by]
     total = s3.co2e_tonnes.sum()
     g = (s3.groupby(key).agg(co2e_tonnes=("co2e_tonnes", "sum"), spend_usd=("spend_amount", "sum"), rows=("co2e_tonnes", "size"))
          .sort_values("co2e_tonnes", ascending=False))
@@ -117,8 +117,11 @@ def top_scope3(by: Literal["category", "activity", "reclassified_category"] = "c
         "top": out,
         "top_by_raw_labels": labelled_top,
         "spread_note": f"largest group {100 * spread.max() / total:.1f}% vs smallest {100 * spread.min() / total:.1f}% of Scope 3",
-        "caveat": (f"{s3.category_mismatch.mean():.0%} of rows carry a category label inconsistent with their activity; "
-                   "prefer 'activity' or 'reclassified_category' for decisions.") if by == "category" else None,
+        "caveat": (f"{s3.category_mismatch.mean():.0%} of rows carry a category label inconsistent with their activity "
+                   f"(random assignment would match about {1 / s3.category_num.nunique():.0%}); labels carry little information. "
+                   "Compare with 'activity' and 'reclassified_category'.") if by == "category" else
+                  ("The activity-to-category mapping behind this view is LLM-inferred and not verified by the client or an expert; "
+                   "treat it as indicative and present it next to the labelled view." if by == "reclassified_category" else None),
     }
 
 
@@ -168,6 +171,9 @@ def supplier_priority(inv: Inventory | None = None) -> dict:
         })
     return {
         "method": "score = 0.5*emissions + 0.3*intensity + 0.2*low-quality-data share (min-max normalised)",
+        "intensity_caveat": ("Carbon intensity is driven by emission factors that look arbitrary (similar medians for every activity, "
+                             "very wide ranges, uncorrelated with spend), and suppliers often do not match their activities. "
+                             "Treat this ranking as indicative, not as evidence of which supplier is worse."),
         "spread_note": f"top supplier {g.share_pct.max():.1f}% vs bottom {g.share_pct.min():.1f}% of Scope 3: emissions are evenly spread",
         "suppliers": rows,
     }

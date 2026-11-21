@@ -1,0 +1,97 @@
+# Catalog for the quality rules in src/quality.py.
+#
+# GROUNDING RULE: the only authority on what the GHG Protocol says is the provided document
+# (data/ghg-protocol-revised.pdf). Nothing in this file states what the standard requires, and no outside
+# standard, tool or factor library is named. The rules in code establish FACTS about the data and compute the
+# evidence. What the standard says about each fact is retrieved from the document when a question is asked,
+# using queries the LLM writes from the user's question and the finding (see quality_node in src/graph.py).
+#
+# - title: neutral description of what the data shows (not a compliance claim).
+# - dimension: consistency | completeness | traceability | plausibility | insight
+# - basis: data (computed from the file) | statistical (computed test) | heuristic (keyword or rule of thumb)
+# - fallback_query: used to search the document only if the LLM cannot write a query.
+# Severity is our triage of how much the data problem limits use of the numbers. It is not from the standard.
+
+PERIOD:
+  title: "Reporting periods differ across scopes"
+  dimension: completeness
+  basis: data
+  fallback_query: "reporting period annual inventory"
+
+COMPLETENESS:
+  title: "Missing values, duplicate rows or constant columns"
+  dimension: completeness
+  basis: data
+  fallback_query: "completeness principle accounting reporting"
+
+RECALC:
+  title: "Scope {scope}: reported tonnes versus amount x factor"
+  dimension: consistency
+  basis: data
+  fallback_query: "calculation of emissions activity data emission factors"
+
+FACTOR_META:
+  title: "Emission-factor unit, source or year not recorded"
+  dimension: traceability
+  basis: data
+  fallback_query: "transparency documentation of emission factors and assumptions"
+
+RENEW_UNSUPPORTED:
+  title: "A renewable share is recorded without any record of the instrument behind it"
+  dimension: traceability
+  basis: data
+  fallback_query: "green power purchases renewable energy certificates reporting"
+
+FACTOR_IGNORES_ATTRIBUTE:
+  title: "A recorded attribute (renewable share) never changes the emission factor"
+  dimension: consistency
+  basis: data
+  fallback_query: "green power purchases reporting electricity emissions"
+
+SINGLE_FACTOR:
+  title: "A dominant source uses one factor across different sites"
+  dimension: plausibility
+  basis: data
+  fallback_query: "emission factors site specific data quality"
+
+HEAT_OVERLAP:
+  title: "Fuel burned on site (Scope 1) and heat or steam bought at the same site (Scope 2)"
+  dimension: consistency
+  basis: heuristic
+  fallback_query: "double counting scope 1 scope 2 purchased steam heat"
+
+CONCENTRATION:
+  title: "Scope {scope} emissions are concentrated in one entity"
+  dimension: insight
+  basis: data
+  fallback_query: "inventory quality management priorities data collection"
+
+LABEL_NO_INFO:
+  title: "Scope 3 category labels carry no information about the activity"
+  dimension: plausibility
+  basis: statistical
+  fallback_query: "scope 3 other indirect emissions categories activities"
+
+SUPPLIER_NO_INFO:
+  title: "Suppliers do not match the activities they are recorded against"
+  dimension: plausibility
+  basis: statistical
+  fallback_query: "inventory quality management data collection checks"
+
+FACTOR_NOT_DISCRIMINATING:
+  title: "Spend-based factors do not differ by activity"
+  dimension: plausibility
+  basis: statistical
+  fallback_query: "uncertainty emission factors data quality"
+
+SPEND_ONLY:
+  title: "All Scope 3 rows are calculated as spend x factor"
+  dimension: plausibility
+  basis: data
+  fallback_query: "scope 3 calculation methods data quality uncertainty"
+
+DQ_LABELS:
+  title: "Data-quality labels are uninformative or contradictory"
+  dimension: traceability
+  basis: heuristic
+  fallback_query: "data quality indicators uncertainty assessment"

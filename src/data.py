@@ -35,9 +35,9 @@ SCOPE3_CATEGORIES = {
     15: "Investments",
 }
 
-# Where each activity *should* sit under the GHG Protocol, used to detect mislabelling
-# and to offer a reclassified view of Scope 3.
-EXPECTED_CATEGORY = {
+# LLM-INFERRED mapping (not from the provided files, not expert-verified): where each activity would sit under
+# the GHG Protocol Scope 3 categories. Used to detect mislabelling and to offer an *indicative* reclassified view.
+INFERRED_CATEGORY = {
     "Raw Materials - Steel": 1,
     "Raw Materials - Aluminum": 1,
     "Packaging Materials": 1,
@@ -100,11 +100,12 @@ def load_inventory(data_dir: Path = DATA_DIR) -> Inventory:
 
     s3["category_num"] = s3["category"].str.extract(r"(\d+)").astype(int)
     s3["category_name"] = s3["category_num"].map(SCOPE3_CATEGORIES)
-    s3["expected_category_num"] = s3["activity_description"].map(EXPECTED_CATEGORY)
-    s3["expected_category_name"] = s3["expected_category_num"].map(SCOPE3_CATEGORIES)
-    s3["category_mismatch"] = s3["category_num"] != s3["expected_category_num"]
+    s3["inferred_category_num"] = s3["activity_description"].map(INFERRED_CATEGORY)
+    s3["inferred_category_name"] = s3["inferred_category_num"].map(SCOPE3_CATEGORIES)
+    # Flags are only raised where a mapping exists; an activity or supplier the mapping does not know is "unknown", not "wrong".
+    s3["category_mismatch"] = s3["inferred_category_num"].notna() & (s3["category_num"] != s3["inferred_category_num"])
     s3["supplier_mismatch"] = [
-        act not in EXPECTED_SUPPLIER_ACTIVITIES.get(sup, set())
+        sup in EXPECTED_SUPPLIER_ACTIVITIES and act not in EXPECTED_SUPPLIER_ACTIVITIES[sup]
         for sup, act in zip(s3["supplier"], s3["activity_description"])
     ]
     # Spend-based factor is kg CO2e per USD: tonnes = spend * factor / 1000
@@ -120,23 +121,28 @@ def get_inventory() -> Inventory:
 def data_card(inv: Inventory | None = None) -> str:
     """Compact description of the inventory that goes into the system prompt.
 
-    The model gets the shape and caveats of the data, never the raw rows.
+    Everything here is computed from the loaded data and from the quality findings, so it describes whichever
+    company's inventory is loaded. The model gets the shape and caveats of the data, never the raw rows.
     """
+    from src.quality import run_quality_checks  # local import: quality imports this module
+
     inv = inv or get_inventory()
-    s1, s2, s3 = inv.scope1, inv.scope2, inv.scope3
 
-    def period(df: pd.DataFrame) -> str:
-        return f"{df['date'].min():%Y-%m} to {df['date'].max():%Y-%m}"
+    def describe(n: int, df: pd.DataFrame) -> str:
+        ent = next((c for c in ("facility", "supplier") if c in df.columns), None)
+        names = f" Distinct {ent} values: {', '.join(sorted(map(str, df[ent].unique()))[:12])}." if ent else ""
+        return (f"- scope{n} table: {len(df)} rows, {df['date'].min():%Y-%m} to {df['date'].max():%Y-%m}, "
+                f"total {df['co2e_tonnes'].sum():,.1f}. Columns: {', '.join(c for c in df.columns if c not in ('month', 'quarter'))}.{names}")
 
+    findings = [f for f in run_quality_checks("all", inv)["findings"] if f["severity"] in ("high", "medium")]
+    caveats = "\n".join(f"- {f['headline']}." for f in findings)
+    inferred = "inferred_category_num" in inv.scope3 and inv.scope3["inferred_category_num"].notna().any()
     return f"""\
 DATA CARD (company emissions inventory; units tCO2e)
-- scope1 table: {len(s1)} rows, {period(s1)}, total {s1.co2e_tonnes.sum():,.1f}. Columns: facility, activity_type, fuel_type, consumption_amount, consumption_unit, emission_factor, co2e_tonnes, date, notes.
-  Facilities: {', '.join(sorted(s1.facility.unique()))}.
-- scope2 table: {len(s2)} rows, {period(s2)}, total {s2.co2e_tonnes.sum():,.1f} (location-based only). Columns: facility, energy_type, consumption_amount, consumption_unit, grid_region, emission_factor, co2e_tonnes, date, renewable_percentage, notes.
-- scope3 table: {len(s3)} rows, {period(s3)}, total {s3.co2e_tonnes.sum():,.1f}. Columns: category (e.g. 'Category 6'), category_num, category_name, activity_description, spend_amount (USD), emission_factor (kg CO2e/USD), co2e_tonnes, date, supplier, data_quality, expected_category_num, category_mismatch, supplier_mismatch.
-KNOWN CAVEATS (always mention the relevant ones):
-- Scope 1 and 2 cover Jan-Mar 2024 only (3 months); Scope 3 covers Jan-Dec 2024. Totals across scopes mix periods.
-- Scope 3 is 100% spend-based. {s3.category_mismatch.mean():.0%} of rows have a category label inconsistent with the activity (e.g. air travel labelled Category 11), so label-based category totals are unreliable; tools offer a reclassified view by activity.
-- {s3.supplier_mismatch.mean():.0%} of Scope 3 rows pair a supplier with an implausible activity (e.g. 'Corporate Travel' supplying trucking).
-- Scope 2 reports only one (location-based) figure even though renewable_percentage is recorded.
-"""
+{describe(1, inv.scope1)}
+{describe(2, inv.scope2)}
+{describe(3, inv.scope3)}
+KNOWN CAVEATS (computed by the quality checks; always mention the relevant ones, call run_quality_checks for evidence):
+{caveats}
+- Annualised figures extrapolate shorter scopes to 12 months and assume no seasonality, so they are estimates.
+""" + ("- The reclassified Scope 3 view uses an LLM-inferred activity-to-category mapping that is unverified: treat it as indicative and say so.\n" if inferred else "")

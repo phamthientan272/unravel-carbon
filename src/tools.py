@@ -12,6 +12,7 @@ from typing import Literal
 from langchain_core.tools import tool
 
 from src import analytics, benchmark, quality
+from src.grounding import build_quality_package
 from src.kb import get_kb
 
 
@@ -39,8 +40,8 @@ def get_breakdown(scope: Literal["1", "2", "3"], by: str) -> str:
 def get_top_scope3(by: Literal["category", "activity", "reclassified_category"] = "category", top_n: int = 5) -> str:
     """Rank Scope 3 emissions, with the top activities and suppliers inside each group.
     by='category' uses the category labels in the data (92% are inconsistent with the activity);
-    by='activity' ranks activity descriptions; by='reclassified_category' maps activities to their correct
-    GHG Protocol category. For 'highest category' questions, call it with 'category' AND 'reclassified_category'."""
+    by='activity' ranks activity descriptions; by='reclassified_category' maps activities to the GHG Protocol category
+    inferred for them (LLM-inferred mapping, unverified: indicative only). For 'highest category' questions, call it with 'category' AND 'reclassified_category'."""
     return _json(analytics.top_scope3(by, top_n))
 
 
@@ -61,10 +62,22 @@ def run_sql(query: str) -> str:
 
 @tool
 def run_quality_checks(scope: Literal["all", "1", "2", "3"] = "all") -> str:
-    """Run rule-based quality checks on the inventory: arithmetic, period coverage, Scope 2 method,
-    double counting, category and supplier mapping, factor consistency, data-quality labels. Returns findings with
-    severity, evidence, recommendation and a GHG Protocol reference. Use for any validity, accuracy or quality question."""
+    """Run rule-based quality checks on the inventory: arithmetic, period coverage, factor documentation, renewable
+    share, double-counting risk, category and supplier labels, factor consistency, data-quality labels. Returns findings
+    (facts about the data) with severity and computed evidence. It does NOT say what the GHG Protocol requires: use
+    search_knowledge_base for that. Use for any validity, accuracy or quality question."""
     return _json(quality.run_quality_checks(scope))
+
+
+@tool
+def assess_quality(question: str, scope: Literal["all", "1", "2", "3"] = "all") -> str:
+    """Assess data quality against what the provided GHG Protocol document says. Returns the quality findings (facts about
+    the data) AND passages from the GHG Protocol linked to each finding by `passage_ids`. Use it for follow-ups about a
+    specific quality issue or about whether the data follows the GHG Protocol. Pass the user's question, so the search
+    queries fit it. Cite only the pages of the returned passages. If no passage addresses a finding, say the provided
+    document does not address it."""
+    pkg = build_quality_package(question, scope, text_chars=700)
+    return _json({k: v for k, v in pkg.items() if k != "notes"})
 
 
 @tool
@@ -86,4 +99,4 @@ def search_knowledge_base(query: str, source: Literal["all", "ghg_protocol", "pe
 
 
 ALL_TOOLS = [get_emissions_summary, get_breakdown, get_top_scope3, get_supplier_priority, run_sql,
-             run_quality_checks, compare_with_peers, search_knowledge_base]
+             run_quality_checks, assess_quality, compare_with_peers, search_knowledge_base]

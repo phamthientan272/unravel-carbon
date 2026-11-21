@@ -67,7 +67,7 @@ def chunk_page(text: str, source: str, page: int) -> list[Chunk]:
 
 
 def extract_pages(source: str) -> list[tuple[int, str]]:
-    """Return (page_number, text) for a PDF. Image-only PDFs use the cached OCR output."""
+    """Return (page_number, text) for a PDF. peer2 uses the cached OCR output (its tables are images)."""
     if source == "peer2_emissions_report.pdf":
         if not OCR_CACHE.exists():
             raise FileNotFoundError(f"{OCR_CACHE} missing: run `python scripts/ocr_peer2.py` first (needs GEMINI_API_KEY).")

@@ -1,257 +1,396 @@
-"""Rule-based quality assessment of the emissions inventory.
+"""Rule-based quality assessment of a GHG inventory (Scope 1, 2 and 3 tables).
 
-Checks are deterministic and return structured findings with the evidence behind them.
-The LLM's job is only to explain and prioritise them, with GHG Protocol citations
-retrieved from the knowledge base.
+Design
+------
+- **Generic rules, no company-specific names.** Rules find a company's own facilities, activities and
+  columns at run time. Nothing here mentions a particular facility, fuel, supplier or grid region.
+- **A column spec is the only adapter.** A `QualitySpec` says which column plays which role (amount, factor,
+  reported tonnes, site, source, ...). A new company needs a new spec (the LLM can propose one, a person confirms).
+  Rules whose input column is missing are skipped, not guessed.
+- **Rules establish facts, the document supplies the standard.** Every finding's evidence is computed from the
+  data. What the GHG Protocol says about it is NOT stored here: the provided document is the only authority and it
+  is searched when a question is asked, with queries the LLM writes from the question and the finding (src/graph.py).
+  `quality_catalog.yaml` holds only neutral titles and a fallback search query.
+- **The LLM never invents findings.** It explains and prioritises them, citing only retrieved passages.
+
+Every finding also states its `dimension` (what kind of quality problem) and `basis` (how it was established:
+`data`, `statistical` or `heuristic`), so a reader knows how much to trust it.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass, field
+from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
 import numpy as np
+import pandas as pd
+import yaml
 
 from src.data import Inventory, get_inventory
 
 Severity = Literal["high", "medium", "low", "pass"]
 SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2, "pass": 3}
+CATALOG_PATH = Path(__file__).with_name("quality_catalog.yaml")
 
+# An association counts as informative only if it is statistically detectable AND the effect is not tiny.
+MIN_EXCESS_V = 0.3
+ALPHA = 0.05
+DOMINANT_SOURCE_SHARE = 0.20  # a source carrying at least this share of a scope's tonnes
+CONCENTRATION_SHARE = 0.50  # one entity carrying at least this share of a scope's tonnes
+
+
+# --- column spec: the only place that knows a company's column names ----------------------------
+
+@dataclass(frozen=True)
+class TableSpec:
+    """Which column plays which role in one scope's table. Optional roles can be None."""
+    amount: str                      # activity amount (consumption, or spend)
+    factor: str                      # emission factor
+    reported: str = "co2e_tonnes"    # reported tonnes CO2e
+    date: str = "date"
+    entity: str | None = None        # who emits: facility (Scope 1/2) or supplier (Scope 3)
+    site: str | None = None          # physical site (cross-site and overlap rules)
+    source: str | None = None        # what is burned / bought / purchased (fuel, energy type, activity)
+    kind: str | None = None          # broader activity type, e.g. stationary vs mobile combustion
+    region: str | None = None        # grid or market region label
+    renewable_pct: str | None = None # recorded renewable share
+    factor_unit: str | None = None   # unit of the emission factor, if recorded
+    factor_origin: str | None = None # source / year of the emission factor, if recorded
+    method: Literal["activity", "spend"] = "activity"
+    # Scope 3 only
+    category: str | None = None
+    supplier: str | None = None
+    quality_label: str | None = None
+
+
+@dataclass(frozen=True)
+class QualitySpec:
+    scope1: TableSpec
+    scope2: TableSpec
+    scope3: TableSpec
+
+
+# Spec for the sample inventory in data/. A new company supplies its own.
+DEFAULT_SPEC = QualitySpec(
+    scope1=TableSpec(amount="consumption_amount", factor="emission_factor", entity="facility", site="facility",
+                     source="fuel_type", kind="activity_type"),
+    scope2=TableSpec(amount="consumption_amount", factor="emission_factor", entity="facility", site="facility",
+                     source="energy_type", region="grid_region", renewable_pct="renewable_percentage"),
+    scope3=TableSpec(amount="spend_amount", factor="emission_factor", entity="supplier", source="activity_description",
+                     method="spend", category="category", supplier="supplier", quality_label="data_quality"),
+)
+
+
+# --- findings and catalog -----------------------------------------------------------------------
 
 @dataclass
 class Finding:
     id: str
-    scope: str  # "1", "2", "3" or "all"
+    scope: str  # "1", "2", "3", "1,2" or "all"
     severity: Severity
     title: str
     evidence: str
-    recommendation: str
-    ghg_reference: str = ""
-    kb_query: str = ""  # what to search the GHG Protocol for when explaining this finding
+    fallback_query: str = ""  # used to search the document only if the LLM cannot write a query
+    dimension: str = ""  # consistency | completeness | compliance | plausibility | traceability | insight
+    basis: str = ""      # data | statistical | heuristic
+    headline: str = ""   # first sentence of the evidence, for compact summaries
     impact_tco2e: float | None = None
     extra: dict = field(default_factory=dict)
 
 
-def _recalc(amount, factor, reported):
-    """Return the unit scale (1 or 1/1000) that reproduces the reported tonnes, or None."""
+@lru_cache(maxsize=1)
+def _catalog() -> dict:
+    return yaml.safe_load(CATALOG_PATH.read_text())
+
+
+def _finding(rule: str, fid: str, scopes: str, severity: Severity, evidence: str,
+             impact: float | None = None, **fmt) -> Finding:
+    """Build a finding: computed evidence + curated advice from the catalog."""
+    c = _catalog()[rule]
+    first = re.split(r"\.\s+(?=[A-Z])", evidence, maxsplit=1)[0].rstrip(".")  # first sentence
+    return Finding(
+        id=fid, scope=scopes, severity=severity, title=c["title"].format(**fmt), evidence=evidence,
+        fallback_query=c["fallback_query"], dimension=c["dimension"], basis=c["basis"], headline=first[:300],
+        impact_tco2e=None if impact is None else round(float(impact), 1),
+    )
+
+
+# --- small helpers ------------------------------------------------------------------------------
+
+def _col(df: pd.DataFrame, name: str | None) -> pd.Series | None:
+    return df[name] if name and name in df.columns else None
+
+
+def _months(df: pd.DataFrame, spec: TableSpec) -> list[str]:
+    return sorted(pd.to_datetime(df[spec.date]).dt.to_period("M").astype(str).unique())
+
+
+def _implied_unit(amount: float, factor: float, reported: float) -> str | None:
+    """Which unit of the factor reproduces the reported tonnes: t per unit, kg per unit, or neither."""
     for scale, label in ((1.0, "t CO2e per unit"), (1e-3, "kg CO2e per unit")):
         if np.isclose(amount * factor * scale, reported, rtol=0.01, atol=0.01):
             return label
     return None
 
 
-def check_scope1(inv: Inventory) -> list[Finding]:
-    s1 = inv.scope1
+def _implied_units(df: pd.DataFrame, spec: TableSpec) -> pd.Series:
+    return pd.Series([_implied_unit(a, f, r) for a, f, r in zip(df[spec.amount], df[spec.factor], df[spec.reported])],
+                     index=df.index)
+
+
+def association(a: pd.Series, b: pd.Series, perms: int = 1000, seed: int = 0) -> dict:
+    """Does knowing `a` tell you anything about `b`? Cramer's V corrected for chance, plus a permutation p-value.
+
+    Raw Cramer's V is inflated for many categories and few rows, so the chance level (mean V over shuffled
+    labels) is subtracted: `excess_v` is 0 for unrelated columns and 1 for a perfect link. Needs no mapping.
+    """
+    x, y = pd.factorize(a)[0], pd.factorize(b)[0]
+    r, c, n = x.max() + 1, y.max() + 1, len(x)
+    if r < 2 or c < 2:
+        return {"excess_v": 0.0, "p": 1.0, "informative": False}
+
+    def chi2(xx, yy):
+        t = np.bincount(xx * c + yy, minlength=r * c).reshape(r, c).astype(float)
+        e = t.sum(1, keepdims=True) * t.sum(0, keepdims=True) / n
+        m = e > 0
+        return float(((t - e) ** 2 / np.where(m, e, 1))[m].sum())
+
+    obs = chi2(x, y)
+    rng = np.random.default_rng(seed)
+    null = np.array([chi2(x, rng.permutation(y)) for _ in range(perms)])
+    k = min(r - 1, c - 1)
+    v = lambda s: float(np.sqrt(s / (n * k)))
+    chance = v(null.mean())
+    excess = (v(obs) - chance) / (1 - chance) if chance < 1 else 0.0
+    p = (1 + int((null >= obs).sum())) / (perms + 1)
+    return {"excess_v": round(max(excess, 0.0), 3), "p": round(p, 3), "informative": bool(p < ALPHA and excess >= MIN_EXCESS_V)}
+
+
+# --- rules that run on any single scope table ---------------------------------------------------
+
+def _recalc(n: int, df: pd.DataFrame, spec: TableSpec) -> Finding:
+    units = _implied_units(df, spec)
+    failed = int(units.isna().sum())
+    src = _col(df, spec.source)
+    by_source = units.groupby(src).agg(lambda u: u.dropna().iloc[0] if u.notna().any() else "none").to_dict() if src is not None else {}
+    mixed = len(set(by_source.values())) > 1
+    ev = (f"{len(df) - failed}/{len(df)} rows reproduce the reported tonnes within 1%."
+          + (f" Implied factor unit by source: {by_source}." if by_source else "")
+          + (" The unit differs between sources." if mixed else ""))
+    return _finding("RECALC", f"S{n}-RECALC", str(n), "pass" if failed == 0 else "high", ev, scope=n)
+
+
+def _single_factor(n: int, df: pd.DataFrame, spec: TableSpec) -> Finding | None:
+    site, src = _col(df, spec.site), _col(df, spec.source)
+    if site is None or src is None:
+        return None
+    total = df[spec.reported].sum()
+    hits = []
+    for source, g in df.groupby(src):
+        share = g[spec.reported].sum() / total
+        if share >= DOMINANT_SOURCE_SHARE and site[g.index].nunique() > 1 and g[spec.factor].nunique() == 1:
+            hits.append((source, g, share))
+    if not hits:
+        return None
+    parts = []
+    for source, g, share in hits:
+        region = _col(g, spec.region)
+        parts.append(f"{source} is {g[spec.reported].sum():,.0f} t ({100 * share:.0f}% of Scope {n}) but all {site[g.index].nunique()} sites use "
+                     f"the same factor ({g[spec.factor].iloc[0]:g})"
+                     + (f" and carry region labels ({', '.join(sorted(region.unique()))}) that do not change it" if region is not None and region.nunique() > 1 else ""))
+    impact = sum(g[spec.reported].sum() for _, g, _ in hits)
+    return _finding("SINGLE_FACTOR", f"S{n}-SINGLE-FACTOR", str(n), "medium", ". ".join(parts) + ".", impact)
+
+
+def _concentration(n: int, df: pd.DataFrame, spec: TableSpec) -> Finding | None:
+    ent = _col(df, spec.entity)
+    if ent is None:
+        return None
+    by = df.groupby(ent)[spec.reported].sum().sort_values(ascending=False)
+    share = by.iloc[0] / by.sum()
+    if share < CONCENTRATION_SHARE:
+        return None
+    top = by.index[0]
+    src = _col(df, spec.source)
+    drivers = ""
+    if src is not None:
+        s = df[ent == top].groupby(src)[spec.reported].sum().nlargest(2)
+        drivers = " Largest sources there: " + ", ".join(f"{k} ({v:,.0f} t)" for k, v in s.items()) + "."
+    ev = f"{top} = {by.iloc[0]:,.0f} t ({100 * share:.0f}% of Scope {n}).{drivers}"
+    return _finding("CONCENTRATION", f"S{n}-CONCENTRATION", str(n), "low", ev, by.iloc[0], scope=n)
+
+
+def _attribute_ignored(n: int, df: pd.DataFrame, spec: TableSpec) -> Finding | None:
+    pct, site, src = _col(df, spec.renewable_pct), _col(df, spec.site), _col(df, spec.source)
+    if pct is None or site is None or src is None:
+        return None
+    groups = []
+    for (s, e), g in df.groupby([site, src]):
+        if g[spec.renewable_pct].nunique() > 1 and g[spec.factor].nunique() == 1:
+            groups.append(f"{s}/{e}: {g[spec.renewable_pct].min():g}% to {g[spec.renewable_pct].max():g}%")
+    if not groups:
+        return None
+    ev = (f"In {len(groups)} site/source groups the recorded renewable share changes over time ({'; '.join(groups)}) "
+          "but the emission factor never changes, so the reported tonnes do not reflect it.")
+    return _finding("FACTOR_IGNORES_ATTRIBUTE", "S2-RENEW-INCONSISTENT", str(n), "medium", ev)
+
+
+# --- Scope 2 ------------------------------------------------------------------------------------
+
+def _renewable_unsupported(df: pd.DataFrame, spec: TableSpec) -> Finding | None:
+    pct = _col(df, spec.renewable_pct)
+    if pct is None or (pct > 0).sum() == 0:
+        return None
+    if any(re.search(r"certificate|\brec\b|ppa|contract|instrument|supplier", c, re.I) for c in df.columns):
+        return None  # some instrument information is recorded; do not claim it is missing
+    impact = float((df[spec.reported] * pct / 100).sum())
+    ev = (f"A renewable share is recorded on {int((pct > 0).sum())} of {len(df)} rows (up to {pct.max():g}%), but no column records the "
+          f"certificate, contract or other instrument behind it. Applying the recorded share to the reported tonnes would lower them by about {impact:,.0f} t.")
+    return _finding("RENEW_UNSUPPORTED", "S2-RENEW-UNSUPPORTED", "2", "medium", ev, impact)
+
+
+# --- Scope 3 ------------------------------------------------------------------------------------
+
+def _scope3_checks(df: pd.DataFrame, spec: TableSpec) -> list[Finding]:
     out: list[Finding] = []
-    units = [_recalc(a, f, r) for a, f, r in zip(s1.consumption_amount, s1.emission_factor, s1.co2e_tonnes)]
-    failed = sum(u is None for u in units)
-    mix = s1.assign(factor_unit=units).groupby("fuel_type").factor_unit.first().to_dict()
-    out.append(Finding(
-        id="S1-RECALC", scope="1", severity="pass" if failed == 0 else "high",
-        title="Scope 1 arithmetic reproduces (activity x factor)",
-        evidence=f"{len(s1) - failed}/{len(s1)} rows recompute within 1%. Implied factor units differ by fuel: {mix}.",
-        recommendation="Store emission-factor units and source (e.g. EPA, DEFRA, version/year) in their own columns; mixed kg/t factor units are an error waiting to happen.",
-        ghg_reference="Corporate Standard ch.6 (calculation tools; transparency)",
-        kb_query="emission factors documentation transparency calculation approach",
-    ))
-    plant = s1[s1.facility == "Manufacturing Plant"].co2e_tonnes.sum()
-    out.append(Finding(
-        id="S1-HOTSPOT", scope="1", severity="low",
-        title="Scope 1 is concentrated in the Manufacturing Plant",
-        evidence=f"Manufacturing Plant = {plant:,.0f} t ({100 * plant / s1.co2e_tonnes.sum():.0f}% of Scope 1): coal boilers and cement process emissions.",
-        recommendation="Prioritise measured fuel data (metered/invoiced coal tonnage, cement clinker ratio) at the plant; these drive accuracy more than any other Scope 1 source.",
-        ghg_reference="Corporate Standard ch.7 (managing inventory quality)",
-        kb_query="process emissions cement direct measurement",
-    ))
-    ref = s1[s1.fuel_type == "Refrigerants"]
-    out.append(Finding(
-        id="S1-GWP", scope="1", severity="low",
-        title="Refrigerant GWP source not documented",
-        evidence=f"R404A factor = {ref.emission_factor.iloc[0]:g} (matches IPCC AR4 GWP 3,922; AR5 is 3,943 and AR6 is higher).",
-        recommendation="State the IPCC assessment report used for GWPs and apply it consistently across the inventory; consider the mass-balance method for refrigerant leaks.",
-        ghg_reference="Corporate Standard ch.4/6 (HFCs; GWP)",
-        kb_query="HFC refrigeration fugitive emissions global warming potential",
-    ))
+    total = df[spec.reported].sum()
+    act, cat, sup = _col(df, spec.source), _col(df, spec.category), _col(df, spec.supplier)
+
+    if cat is not None and act is not None:
+        cat_num = cat.astype(str).str.extract(r"(\d+)")[0].astype(float)
+        a = association(act, cat)
+        spread = df.groupby(act).apply(lambda g: cat_num[g.index].nunique())
+        ev = (f"Knowing the activity tells you {'something' if a['informative'] else 'almost nothing'} about the category label "
+              f"(chance-corrected association {a['excess_v']:.2f} on a 0-1 scale, permutation p = {a['p']:.2f}). On average each activity "
+              f"appears in {spread.mean():.0f} of {cat_num.nunique()} categories.")
+        out.append(_finding("LABEL_NO_INFO", "S3-CATEGORY-MAP", "3", "pass" if a["informative"] else "high", ev,
+                            None if a["informative"] else total))
+
+    if sup is not None and act is not None:
+        a = association(act, sup)
+        ev = (f"Knowing the activity tells you {'something' if a['informative'] else 'little'} about the supplier (chance-corrected "
+              f"association {a['excess_v']:.2f}, permutation p = {a['p']:.2f}). Each supplier appears with "
+              f"{df.groupby(sup)[spec.source].nunique().mean():.0f} of {act.nunique()} activities on average.")
+        out.append(_finding("SUPPLIER_NO_INFO", "S3-SUPPLIER-MAP", "3", "pass" if a["informative"] else "medium", ev))
+
+    if spec.method == "spend":
+        out.append(_finding("SPEND_ONLY", "S3-SPEND-BASED", "3", "medium",
+                            f"All {len(df)} rows are calculated as the money spent multiplied by an emission factor. No row uses a physical quantity (units, distance, mass)."))
+
+    if act is not None and act.nunique() >= 3:
+        groups = df.groupby(act)[spec.factor]
+        ss_between = float((groups.transform("mean").sub(df[spec.factor].mean()) ** 2).sum())
+        eta2 = ss_between / float(((df[spec.factor] - df[spec.factor].mean()) ** 2).sum())
+        disp = groups.agg(["min", "max", "median"])
+        corr = df[spec.amount].corr(df[spec.factor])
+        if eta2 < 0.10:
+            ev = (f"Activity explains only {100 * eta2:.0f}% of the variation in the factor. Medians are similar for every activity "
+                  f"({disp['median'].min():.1f} to {disp['median'].max():.1f}), the largest factor is {(disp['max'] / disp['min']).median():.0f}x the smallest "
+                  f"within an activity (median), and the factor is uncorrelated with the amount (r = {corr:.2f}). The factor does not depend on the activity or the amount.")
+            out.append(_finding("FACTOR_NOT_DISCRIMINATING", "S3-FACTORS", "3", "medium", ev, total))
+
+    ql = _col(df, spec.quality_label)
+    if ql is not None:
+        counts = ql.value_counts()
+        even = len(counts) > 2 and counts.max() / counts.min() < 1.5
+        primary = ql.astype(str).str.contains(r"primary|measured|supplier[- ]specific", case=False, regex=True)
+        contradiction = int(primary.sum()) if spec.method == "spend" else 0
+        if even or contradiction:
+            ev = (f"Labels are split {'almost evenly' if even else 'unevenly'} across {len(counts)} values "
+                  f"({', '.join(f'{k} {v}' for k, v in counts.items())}).")
+            if contradiction:
+                ev += f" {contradiction} rows are labelled as primary or supplier-specific data although every row is calculated as spend x factor."
+            out.append(_finding("DQ_LABELS", "S3-DQ-LABELS", "3", "medium", ev))
+
     return out
 
 
-def check_scope2(inv: Inventory) -> list[Finding]:
-    s2 = inv.scope2
-    elec = s2[s2.energy_type == "Electricity"]
-    steam = s2[s2.energy_type == "Steam"]
+# --- cross-scope --------------------------------------------------------------------------------
+
+def check_cross_scope(inv: Inventory, spec: QualitySpec = DEFAULT_SPEC) -> list[Finding]:
+    tables = {1: (inv.scope1, spec.scope1), 2: (inv.scope2, spec.scope2), 3: (inv.scope3, spec.scope3)}
     out: list[Finding] = []
 
-    units = [_recalc(a, f, r) for a, f, r in zip(s2.consumption_amount, s2.emission_factor, s2.co2e_tonnes)]
-    failed = sum(u is None for u in units)
-    out.append(Finding(
-        id="S2-RECALC", scope="2", severity="pass" if failed == 0 else "high",
-        title="Scope 2 arithmetic reproduces (consumption x factor)",
-        evidence=f"{len(s2) - failed}/{len(s2)} rows recompute within 1% (electricity factors in kg/kWh, steam in t/MMBtu).",
-        recommendation="Keep it this way, and record factor source and vintage next to each factor.",
-        ghg_reference="Corporate Standard ch.6",
-        kb_query="indirect emissions purchased electricity emission factors",
-    ))
+    months = {n: _months(df, s) for n, (df, s) in tables.items()}
+    spans = {n: f"{m[0]} to {m[-1]} ({len(m)} months)" for n, m in months.items()}
+    same = len({len(m) for m in months.values()}) == 1
+    out.append(_finding("PERIOD", "ALL-PERIOD", "all", "pass" if same else "high",
+                        "Scope 1: " + spans[1] + "; Scope 2: " + spans[2] + "; Scope 3: " + spans[3] + "."
+                        + ("" if same else " Totals across scopes mix different periods.")))
 
-    renewable_adj = (elec.co2e_tonnes * elec.renewable_percentage / 100).sum()
-    out.append(Finding(
-        id="S2-DUAL", scope="2", severity="high",
-        title="Only one Scope 2 figure; no market-based total",
-        evidence=(f"All {len(s2)} rows use grid-average factors (location-based). No market-based column, no contractual instruments "
-                  f"recorded. renewable_percentage (0-{elec.renewable_percentage.max():g}%) is captured but never applied: if backed by "
-                  f"valid certificates (RECs/PPAs) the market-based electricity total could be ~{renewable_adj:,.0f} t lower."),
-        recommendation=("Report both location-based and market-based Scope 2 (GHG Protocol Scope 2 Guidance, 2015). For market-based, "
-                        "use supplier-specific factors or energy attribute certificates meeting the Scope 2 quality criteria, and the "
-                        "residual mix elsewhere. Keep evidence (certificate IDs, PPA contracts) for each renewable claim."),
-        ghg_reference="Scope 2 Guidance (2015) dual reporting. Not in the provided 2004 Corporate Standard, which covers purchased electricity in ch.4 and green power in ch.8/9.",
-        kb_query="purchased electricity green power contracts renewable energy certificates scope 2 reporting",
-        impact_tco2e=round(renewable_adj, 1),
-    ))
+    nulls = sum(int(df.isna().sum().sum()) for df, _ in tables.values())
+    dups = sum(int(df.duplicated().sum()) for df, _ in tables.values())
+    const = {f"scope{n}": [c for c in df.columns if df[c].nunique() <= 1 and len(df) > 1] for n, (df, _) in tables.items()}
+    const = {k: v for k, v in const.items() if v}
+    ev = f"{nulls} null cells and {dups} exact duplicate rows across the three files."
+    if const:
+        ev += f" Constant columns that carry no information: {const}."
+    out.append(_finding("COMPLETENESS", "ALL-COMPLETENESS", "all", "pass" if not (nulls or dups or const) else ("low" if not (nulls or dups) else "medium"), ev))
 
-    out.append(Finding(
-        id="S2-RENEW-INCONSISTENT", scope="2", severity="medium",
-        title="Renewable share recorded but not reflected in emissions",
-        evidence=("Rows with 'increased renewables' / 'some renewables added' notes still use the same grid factor, so the reported "
-                  "number doesn't reflect the procurement the notes describe."),
-        recommendation="Decide per site whether renewables are on-site generation (reduces grid kWh) or contractual (market-based only), and calculate accordingly.",
-        ghg_reference="Corporate Standard ch.4 (scope 2), ch.9 (reporting green power purchases separately)",
-        kb_query="green power purchases reporting optional information",
-    ))
+    missing_unit = [f"scope{n}" for n, (df, s) in tables.items() if _col(df, s.factor_unit) is None]
+    missing_origin = [f"scope{n}" for n, (df, s) in tables.items() if _col(df, s.factor_origin) is None]
+    mixed = {}
+    for n, (df, s) in tables.items():
+        src = _col(df, s.source)
+        if src is not None:
+            u = _implied_units(df, s).groupby(src).agg(lambda x: x.dropna().iloc[0] if x.notna().any() else "none")
+            if u.nunique() > 1:
+                mixed[f"scope{n}"] = u.to_dict()
+    if missing_unit or missing_origin or mixed:
+        ev = (f"No factor unit column in: {missing_unit or 'none'}. No factor source or year column in: {missing_origin or 'none'}."
+              + (f" Implied units differ between sources within a table: {mixed}." if mixed else ""))
+        out.append(_finding("FACTOR_META", "ALL-FACTOR-META", "all", "medium", ev))
 
-    out.append(Finding(
-        id="S2-STEAM-FACTOR", scope="2", severity="medium",
-        title="Steam uses one generic factor and grid-region labels",
-        evidence=(f"Steam is {steam.co2e_tonnes.sum():,.0f} t ({100 * steam.co2e_tonnes.sum() / s2.co2e_tonnes.sum():.0f}% of Scope 2) but every "
-                  f"site uses {steam.emission_factor.iloc[0]:g} t/MMBtu and is tagged with an electricity grid region (CAISO/PJM)."),
-        recommendation="Obtain supplier-specific steam factors (fuel mix and boiler efficiency of the district heating/steam provider). Steam isn't a grid product, so grid-region tags don't apply.",
-        ghg_reference="Corporate Standard ch.4 (scope 2 includes purchased steam)",
-        kb_query="purchased steam heat cogeneration emissions allocation",
-    ))
-
-    plant_steam = steam[steam.facility == "Manufacturing Plant"].co2e_tonnes.sum()
-    out.append(Finding(
-        id="S2-DOUBLE-COUNT", scope="1,2", severity="medium",
-        title="Possible double counting of plant steam (Scope 1 coal boilers vs Scope 2 steam)",
-        evidence=(f"Manufacturing Plant reports coal 'Boiler operations' in Scope 1 and {plant_steam:,.0f} t of 'Process heating' steam in Scope 2. "
-                  "If the steam comes from the company's own boilers it is already counted in Scope 1."),
-        recommendation="Confirm the steam is bought from a third party (invoice/contract). If it comes from owned boilers, remove it from Scope 2.",
-        ghg_reference="Corporate Standard ch.4 (double counting; scope 2 = generation of purchased energy)",
-        kb_query="double counting scope 1 scope 2 steam generated own boilers",
-        impact_tco2e=round(plant_steam, 1),
-    ))
-
-    out.append(Finding(
-        id="S2-GRID-FACTORS", scope="2", severity="low",
-        title="Grid factors labelled by ISO, constant all period, source undocumented",
-        evidence=("Factors: " + ", ".join(f"{r}={f:g}" for r, f in elec.groupby('grid_region').emission_factor.first().items()) +
-                  " kg/kWh. CAISO looks high compared with typical published California grid averages (~0.2-0.25 kg/kWh)."),
-        recommendation="Use eGRID subregion factors (e.g. CAMX, RFCE, ERCT, NEWE) of a stated vintage, including CH4/N2O and, if needed, T&D losses separately.",
-        ghg_reference="Corporate Standard ch.6 (emission factors)",
-        kb_query="electricity emission factors grid average published",
-    ))
+    # Fuel burned on site (Scope 1) and heat/steam bought at the same site (Scope 2): possible double count
+    (s1, p1), (s2, p2) = tables[1], tables[2]
+    site1, site2, src2 = _col(s1, p1.site), _col(s2, p2.site), _col(s2, p2.source)
+    if site1 is not None and site2 is not None and src2 is not None:
+        heat = s2[src2.astype(str).str.contains(r"steam|heat|cool|district", case=False, regex=True)]
+        kind = _col(s1, p1.kind)
+        stationary = s1[kind.astype(str).str.contains(r"stationary|combust|boiler", case=False, regex=True)] if kind is not None else s1
+        shared = sorted(set(heat[p2.site]) & set(stationary[p1.site]))
+        if shared:
+            parts, impact = [], 0.0
+            for site in shared:
+                t = heat[heat[p2.site] == site][p2.reported].sum()
+                impact += t
+                fuels = sorted(stationary[stationary[p1.site] == site][p1.source].astype(str).unique()) if p1.source else []
+                parts.append(f"{site}: Scope 1 burns {', '.join(fuels) or 'fuel'}; Scope 2 buys heat/steam ({t:,.0f} t)")
+            ev = ("; ".join(parts) + ". The data does not say where the heat or steam comes from, so it cannot show whether the same emissions appear in both scopes. "
+                  "This is a question to confirm with the client, not a confirmed error.")
+            out.append(_finding("HEAT_OVERLAP", "S2-DOUBLE-COUNT", "1,2", "medium", ev, impact))
     return out
 
 
-def check_scope3(inv: Inventory) -> list[Finding]:
-    s3 = inv.scope3
-    out: list[Finding] = []
-    total = s3.co2e_tonnes.sum()
-
-    mis = s3[s3.category_mismatch]
-    examples = mis.groupby(["activity_description", "category"]).size().nlargest(3)
-    out.append(Finding(
-        id="S3-CATEGORY-MAP", scope="3", severity="high",
-        title="Scope 3 category labels contradict activities",
-        evidence=(f"{len(mis)}/{len(s3)} rows ({100 * len(mis) / len(s3):.0f}%, {mis.co2e_tonnes.sum():,.0f} t) have a category that "
-                  f"doesn't fit the activity; every activity appears in all 15 categories. Examples: "
-                  + "; ".join(f"'{a}' as {c} x{n}" for (a, c), n in examples.items()) + "."),
-        recommendation=("Re-map using an activity to category rule table (e.g. air travel → Cat 6, steel → Cat 1, equipment → Cat 2, "
-                        "trucking → Cat 4), then review edge cases by hand. Category-level targets and hotspot analysis are invalid until this is fixed."),
-        ghg_reference="Scope 3 Standard category definitions; Corporate Standard ch.4 (scope 3 activities)",
-        kb_query="scope 3 activities business travel transportation purchased materials",
-        impact_tco2e=round(mis.co2e_tonnes.sum(), 1),
-    ))
-
-    sm = s3[s3.supplier_mismatch]
-    out.append(Finding(
-        id="S3-SUPPLIER-MAP", scope="3", severity="medium",
-        title="Supplier and activity combinations are implausible",
-        evidence=(f"{100 * len(sm) / len(s3):.0f}% of rows pair a supplier with an activity outside its business, e.g. "
-                  "'Corporate Travel' supplying trucking and product use, 'WasteManagement Co' supplying IT hardware; no waste activity exists at all."),
-        recommendation="Reconcile against the AP/procurement ledger (vendor master and GL account) before supplier engagement or supplier-specific factors.",
-        ghg_reference="Corporate Standard ch.7 (data management, internal QA)",
-        kb_query="inventory quality management data collection checks",
-    ))
-
-    disp = s3.groupby("activity_description").emission_factor.agg(["min", "max"])
-    out.append(Finding(
-        id="S3-SPEND-BASED", scope="3", severity="medium",
-        title="100% spend-based with highly inconsistent factors",
-        evidence=(f"All {len(s3)} rows use USD x kg/USD factors. The same activity gets factors from ~{disp['min'].min():.2f} to "
-                  f"{disp['max'].max():.2f} kg/USD (a ~{(disp['max'] / disp['min']).median():.0f}x spread within an activity)."),
-        recommendation=("Use one documented EEIO factor set (e.g. USEEIO, a given year, inflation-adjusted) per activity. Then move the largest "
-                        "categories to activity data: air travel by passenger-km and cabin class, trucking by tonne-km, steel/aluminium by tonnes with supplier EPDs."),
-        ghg_reference="Scope 3 Standard / Technical Guidance (calculation methods hierarchy); Corporate Standard ch.7 (uncertainty)",
-        kb_query="uncertainty emission factors data quality activity data",
-    ))
-
-    contradictory = s3[s3.data_quality == "Primary data"]
-    out.append(Finding(
-        id="S3-DQ-LABELS", scope="3", severity="medium",
-        title="Data-quality labels are uninformative or contradictory",
-        evidence=(f"Labels split almost evenly across 5 values ({', '.join(f'{k} {v}' for k, v in s3.data_quality.value_counts().items())}). "
-                  f"{len(contradictory)} rows are 'Primary data' yet are calculated from spend with generic factors. "
-                  "Category_Details is the same constant on every row."),
-        recommendation="Score data quality with a defined rubric (technology, temporal, geographic representativeness, completeness, reliability) and record the actual method used (supplier-specific / hybrid / average-data / spend-based).",
-        ghg_reference="Corporate Standard ch.7 (data quality, uncertainty)",
-        kb_query="data quality indicators uncertainty assessment",
-    ))
-
-    downstream = s3[s3.category_num.between(9, 15)]
-    out.append(Finding(
-        id="S3-DOWNSTREAM-SPEND", scope="3", severity="medium",
-        title="Downstream categories built from purchase spend",
-        evidence=(f"Categories 9-15 hold {downstream.co2e_tonnes.sum():,.0f} t ({100 * downstream.co2e_tonnes.sum() / total:.0f}% of Scope 3) "
-                  "calculated from money paid to suppliers. Downstream emissions (use of sold products, end-of-life, franchises, "
-                  "investments) depend on products sold, not on purchases."),
-        recommendation="Model downstream categories from sales volumes and product specs (e.g. lifetime energy use for Cat 11). Report categories that aren't relevant as excluded, with a justification.",
-        ghg_reference="Scope 3 Standard (downstream categories); Corporate Standard ch.4",
-        kb_query="downstream scope 3 use of sold products disposal",
-        impact_tco2e=round(downstream.co2e_tonnes.sum(), 1),
-    ))
-    return out
+def check_scope1(inv: Inventory, spec: QualitySpec = DEFAULT_SPEC) -> list[Finding]:
+    return _table_checks(1, inv.scope1, spec.scope1)
 
 
-def check_cross_scope(inv: Inventory) -> list[Finding]:
-    s12_months = sorted(set(inv.scope1.month) | set(inv.scope2.month))
-    s3_months = sorted(set(inv.scope3.month))
-    dup = sum(df.duplicated().sum() for df in (inv.scope1, inv.scope2, inv.scope3))
-    nulls = sum(int(df.isna().sum().sum()) for df in (inv.scope1, inv.scope2, inv.scope3))
-    return [
-        Finding(
-            id="ALL-PERIOD", scope="all", severity="high",
-            title="Reporting periods don't match across scopes",
-            evidence=f"Scope 1/2 cover {len(s12_months)} months ({s12_months[0]} to {s12_months[-1]}); Scope 3 covers {len(s3_months)} months ({s3_months[0]} to {s3_months[-1]}).",
-            recommendation="Collect Scope 1 and 2 for the full calendar year before reporting. In the meantime, label any annualised figures as estimates.",
-            ghg_reference="Corporate Standard ch.9 (reporting period; annual reporting)",
-            kb_query="reporting period annual inventory base year",
-        ),
-        Finding(
-            id="ALL-COMPLETENESS", scope="all", severity="pass",
-            title="No missing values or duplicate rows",
-            evidence=f"{nulls} null cells, {dup} exact duplicate rows across the three files.",
-            recommendation="Keep automated null/duplicate checks in the ingestion pipeline.",
-            ghg_reference="Corporate Standard ch.1 (completeness principle)",
-            kb_query="completeness principle accounting reporting",
-        ),
-    ]
+def check_scope2(inv: Inventory, spec: QualitySpec = DEFAULT_SPEC) -> list[Finding]:
+    out = _table_checks(2, inv.scope2, spec.scope2)
+    attr = _attribute_ignored(2, inv.scope2, spec.scope2)
+    method = _renewable_unsupported(inv.scope2, spec.scope2)
+    return out + [f for f in (method, attr) if f]
 
 
-def run_quality_checks(scope: str = "all", inv: Inventory | None = None) -> dict:
+def check_scope3(inv: Inventory, spec: QualitySpec = DEFAULT_SPEC) -> list[Finding]:
+    return [_recalc(3, inv.scope3, spec.scope3)] + _scope3_checks(inv.scope3, spec.scope3)
+
+
+def _table_checks(n: int, df: pd.DataFrame, spec: TableSpec) -> list[Finding]:
+    found = [_recalc(n, df, spec), _single_factor(n, df, spec), _concentration(n, df, spec)]
+    return [f for f in found if f]
+
+
+def run_quality_checks(scope: str = "all", inv: Inventory | None = None, spec: QualitySpec | None = None) -> dict:
     """Run all checks, optionally filtered to one scope ('1', '2', '3' or 'all')."""
-    inv = inv or get_inventory()
-    findings = check_cross_scope(inv) + check_scope1(inv) + check_scope2(inv) + check_scope3(inv)
+    inv, spec = inv or get_inventory(), spec or DEFAULT_SPEC
+    findings = check_cross_scope(inv, spec) + check_scope1(inv, spec) + check_scope2(inv, spec) + check_scope3(inv, spec)
     if scope != "all":
         findings = [f for f in findings if scope in f.scope.split(",") or f.scope == "all"]
-    findings.sort(key=lambda f: SEVERITY_ORDER[f.severity])
+    findings.sort(key=lambda f: (SEVERITY_ORDER[f.severity], -(f.impact_tco2e or 0)))
     counts = {s: sum(f.severity == s for f in findings) for s in SEVERITY_ORDER}
     return {"scope": scope, "severity_counts": counts, "findings": [asdict(f) for f in findings]}
