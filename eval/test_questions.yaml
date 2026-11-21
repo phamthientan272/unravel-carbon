@@ -1,0 +1,68 @@
+# Each case: the question, the intent the router should pick, and facts the answer must contain.
+# `must_include`: every item must match; an item can be a list of alternatives (any one matches).
+# Matching is case-insensitive substring.
+cases:
+  - id: core1_business_travel
+    question: "Should employee business travel be classified as Scope 1 or Scope 3? Explain the reasoning and describe how I can calculate my business travel emissions?"
+    expected_intent: [ghg_education]
+    must_include:
+      - "scope 3"
+      - ["category 6", "cat 6", "cat. 6"]
+      - ["distance", "passenger-km", "passenger kilometer", "km"]
+      - ["owned", "controlled"]
+      - ["p."]   # page citation
+
+  - id: core2_scope2_validity
+    question: "Are my scope 2 emissions calculation valid according to the Greenhouse Gas Protocol?"
+    expected_intent: [quality_assessment]
+    must_include:
+      - ["market-based", "market based"]
+      - ["location-based", "location based"]
+      - ["renewable"]
+      - ["steam"]
+      - ["double count", "double-count"]
+      - ["jan", "q1", "3 months", "three months"]
+
+  - id: core3_peers
+    question: "How do my scope 1 & 2 emissions compare with other companies in my industry (refer to the peer reports), and what insights can I derive from this comparison?"
+    expected_intent: [peer_benchmark]
+    must_include:
+      - "docusign"
+      - "shopify"
+      - ["449"]
+      - ["360"]
+      - ["annualis", "annualiz"]
+      - ["software", "not like-for-like", "comparab"]
+
+  - id: bonus1_top_scope3
+    question: "What is our highest emitting Scope 3 category and what specific activities contribute to it?"
+    expected_intent: [data_question]
+    must_include:
+      - ["category 3", "cat 3"]
+      - ["purchased goods", "category 1", "cat 1"]
+      - ["mislabel", "inconsistent", "92%", "unreliable"]
+
+  - id: bonus2_suppliers
+    question: "Which suppliers should I prioritise to engage for emissions reduction efforts?"
+    expected_intent: [data_question]
+    must_include:
+      - "corporate travel"
+      - ["intensity", "kg/usd", "kg co2e/usd", "per usd", "per dollar"]
+      - ["primary data", "supplier-specific"]
+
+  - id: bonus3_report
+    question: "Generate a summary report of our total emissions by scope with key insights"
+    expected_intent: [report]
+    must_include:
+      - ["1,692", "1692"]
+      - ["2,505", "2505"]
+      - ["374,48", "374.5", "374,5"]
+      - ["manufacturing plant"]
+      - ["steam"]
+
+  - id: extra_sql_long_tail
+    question: "How much Scope 3 emissions came from IT Hardware purchased in Q3 2024?"
+    expected_intent: [data_question]
+    must_include:
+      - ["it hardware"]
+      - ["q3", "jul", "third quarter"]
