@@ -78,7 +78,7 @@ class TraceRecorder:
     def event(self, step: str, **fields) -> None:
         """Append an event. `elapsed_s` is the time since the previous event (roughly: how long the step took)."""
         now = time.perf_counter()
-        for k, v in fields.items():
+        for k, v in list(fields.items()):
             if isinstance(v, str):
                 fields[k], clipped = _clip(v)
                 if clipped:
