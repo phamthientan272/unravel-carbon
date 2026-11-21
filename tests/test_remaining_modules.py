@@ -69,15 +69,7 @@ def test_data_card_describes_the_loaded_inventory():
     from src.data import data_card
 
     card = data_card()
-    assert "DATA CARD" in card and "scope3 table" in card and "KNOWN CAVEATS" in card and "unverified" in card
-
-
-def test_data_card_without_inferred_mapping_omits_that_caveat():
-    from src.data import Inventory, data_card
-
-    inv = get_inventory()
-    plain = Inventory(inv.scope1, inv.scope2, inv.scope3.drop(columns=["inferred_category_num"]))
-    assert "LLM-inferred" not in data_card(plain)
+    assert "DATA CARD" in card and "scope3 table" in card and "KNOWN CAVEATS" in card
 
 
 def test_load_inventory_reads_csvs_from_a_folder(tmp_path):
@@ -188,3 +180,8 @@ def test_text_of_handles_string_and_block_content():
     assert llm.text_of(AIMessage("plain")) == "plain"
     blocks = AIMessage(content=[{"type": "text", "text": "a"}, {"type": "thinking", "x": 1}, "b"])
     assert llm.text_of(blocks).startswith("a") and llm.text_of(blocks).endswith("b")
+
+
+def test_label_caveat_is_absent_when_labels_follow_the_activity():
+    s3 = pd.DataFrame({"activity_description": ["a", "b", "c"] * 20, "category_num": [1, 2, 3] * 20})
+    assert analytics._label_caveat(s3) is None

@@ -35,21 +35,6 @@ SCOPE3_CATEGORIES = {
     15: "Investments",
 }
 
-# LLM-INFERRED mapping (not from the provided files, not expert-verified): where each activity would sit under
-# the GHG Protocol Scope 3 categories. Used to detect mislabelling and to offer an *indicative* reclassified view.
-INFERRED_CATEGORY = {
-    "Raw Materials - Steel": 1,
-    "Raw Materials - Aluminum": 1,
-    "Packaging Materials": 1,
-    "Office Supplies": 1,
-    "IT Hardware": 2,
-    "Manufacturing Equipment": 2,
-    "Inbound Logistics - Truck": 4,
-    "Business Travel - Air": 6,
-    "Employee Commuting": 7,
-    "Product Use Phase": 11,
-}
-
 # Activities a supplier could plausibly provide, used to detect supplier/activity mismatches.
 EXPECTED_SUPPLIER_ACTIVITIES = {
     "SteelCorp Inc": {"Raw Materials - Steel"},
@@ -100,10 +85,7 @@ def load_inventory(data_dir: Path = DATA_DIR) -> Inventory:
 
     s3["category_num"] = s3["category"].str.extract(r"(\d+)").astype(int)
     s3["category_name"] = s3["category_num"].map(SCOPE3_CATEGORIES)
-    s3["inferred_category_num"] = s3["activity_description"].map(INFERRED_CATEGORY)
-    s3["inferred_category_name"] = s3["inferred_category_num"].map(SCOPE3_CATEGORIES)
-    # Flags are only raised where a mapping exists; an activity or supplier the mapping does not know is "unknown", not "wrong".
-    s3["category_mismatch"] = s3["inferred_category_num"].notna() & (s3["category_num"] != s3["inferred_category_num"])
+    # A supplier the mapping does not know is "unknown", not "wrong".
     s3["supplier_mismatch"] = [
         sup in EXPECTED_SUPPLIER_ACTIVITIES and act not in EXPECTED_SUPPLIER_ACTIVITIES[sup]
         for sup, act in zip(s3["supplier"], s3["activity_description"])
@@ -136,7 +118,6 @@ def data_card(inv: Inventory | None = None) -> str:
 
     findings = [f for f in run_quality_checks("all", inv)["findings"] if f["severity"] in ("high", "medium")]
     caveats = "\n".join(f"- {f['headline']}." for f in findings)
-    inferred = "inferred_category_num" in inv.scope3 and inv.scope3["inferred_category_num"].notna().any()
     return f"""\
 DATA CARD (company emissions inventory; units tCO2e)
 {describe(1, inv.scope1)}
@@ -145,4 +126,4 @@ DATA CARD (company emissions inventory; units tCO2e)
 KNOWN CAVEATS (computed by the quality checks; always mention the relevant ones, call run_quality_checks for evidence):
 {caveats}
 - Annualised figures extrapolate shorter scopes to 12 months and assume no seasonality, so they are estimates.
-""" + ("- The reclassified Scope 3 view uses an LLM-inferred activity-to-category mapping that is unverified: treat it as indicative and say so.\n" if inferred else "")
+"""

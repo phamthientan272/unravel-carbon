@@ -73,19 +73,29 @@ def breakdown(scope: int, by: str, inv: Inventory | None = None, top_n: int = 15
     }
 
 
-def top_scope3(by: Literal["category", "activity", "reclassified_category"] = "category", top_n: int = 5,
-               inv: Inventory | None = None) -> dict:
-    """Rank Scope 3 emissions three ways.
+def _label_caveat(s3: pd.DataFrame) -> str | None:
+    """Warn when the category labels do not depend on the activity. Statistical test, so no activity-to-category mapping is needed."""
+    from src.quality import association  # local import: quality imports the data module
 
-    - category: as labelled in the data (the client's reported view; labels are inconsistent)
+    a = association(s3.activity_description, s3.category_num)
+    if a["informative"]:
+        return None
+    return (f"The category labels carry almost no information about the activity (chance-corrected association {a['excess_v']:.2f}, "
+            f"permutation p = {a['p']:.2f}): the same activity appears under many categories. Treat this ranking as unreliable "
+            "and read it next to the 'activity' view.")
+
+
+def top_scope3(by: Literal["category", "activity"] = "category", top_n: int = 5,
+               inv: Inventory | None = None) -> dict:
+    """Rank Scope 3 emissions two ways.
+
+    - category: as labelled in the data (the client's reported view; the labels may carry no information, see the caveat)
     - activity: by activity_description
-    - reclassified_category: activities mapped to an LLM-inferred GHG Protocol category (unverified, indicative)
     Each group lists its top contributing activities and suppliers.
     """
     inv = inv or get_inventory()
     s3 = inv.scope3
-    key = {"category": ["category_num", "category_name"], "activity": ["activity_description"],
-           "reclassified_category": ["inferred_category_num", "inferred_category_name"]}[by]
+    key = {"category": ["category_num", "category_name"], "activity": ["activity_description"]}[by]
     total = s3.co2e_tonnes.sum()
     g = (s3.groupby(key).agg(co2e_tonnes=("co2e_tonnes", "sum"), spend_usd=("spend_amount", "sum"), rows=("co2e_tonnes", "size"))
          .sort_values("co2e_tonnes", ascending=False))
@@ -119,11 +129,7 @@ def top_scope3(by: Literal["category", "activity", "reclassified_category"] = "c
         "top": out,
         "top_by_raw_labels": labelled_top,
         "spread_note": f"largest group {100 * spread.max() / total:.1f}% vs smallest {100 * spread.min() / total:.1f}% of Scope 3",
-        "caveat": (f"{s3.category_mismatch.mean():.0%} of rows carry a category label inconsistent with their activity "
-                   f"(random assignment would match about {1 / s3.category_num.nunique():.0%}); labels carry little information. "
-                   "Compare with 'activity' and 'reclassified_category'.") if by == "category" else
-                  ("The activity-to-category mapping behind this view is LLM-inferred and not verified by the client or an expert; "
-                   "treat it as indicative and present it next to the labelled view." if by == "reclassified_category" else None),
+        "caveat": _label_caveat(s3) if by == "category" else None,
     }
 
 

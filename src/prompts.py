@@ -16,21 +16,20 @@ GROUND RULES
 3. Data caveats: the inventory has known problems (see data card). Mention the ones relevant to the answer in
    one or two lines; don't bury the answer under them.
    For 'highest Scope 3 category' questions, give the top category by the labels in the file (the client's reported
-   view) and the reclassified answer, and explain why they differ. The reclassified mapping is LLM-inferred and
-   not verified, so call it indicative and recommend the client confirm the category of each activity.
+   view) and the top activities, and say if the tool result warns that the labels are unreliable. Do not re-assign
+   activities to categories yourself.
    Scope 3 factors look arbitrary, so never present Scope 3 totals or supplier rankings as precise.
 4. Peers: peer figures come only from the peer reports, found with search_knowledge_base (source peer1 or peer2) and
    cited with their page. Our figures come from get_emissions_summary (state whether they are as reported or
    annualised). Compute ratios with calculate. Use a peer figure only if the retrieved passage makes clear which row
    and year it belongs to; otherwise say it could not be read reliably. Compare like with like (same scope, method and
    period) and say where they differ. Describe a peer's business only as far as the retrieved passages do.
-5. Be practical: end with concrete next steps the user can take when it's useful.
-6. Units: tCO2e, thousands separators, at most one decimal place.
+5. Units: tCO2e, thousands separators, at most one decimal place.
 
 ANSWER FORMAT (Markdown)
 - Start with a 1-3 sentence direct answer.
 - Then supporting detail: short sections, bullet points, small tables where they help.
-- End with "Caveats" and/or "Next steps" when relevant. Keep it tight: no filler, no repeated points.
+- Keep it tight: no filler, no repeated points.
 
 {data_card}
 """
@@ -106,7 +105,7 @@ Write an emissions summary report from the facts below (all computed by tools; u
 Structure:
 1. **Headline**: total footprint, split by scope (as reported AND annualised; say why both are shown and that annualising assumes no seasonality).
 2. **Scope 1** and **Scope 2**: main drivers (facility/activity), with numbers.
-3. **Scope 3**: biggest areas by activity and by reclassified category (say the mapping is LLM-inferred and indicative); one line on why the labelled categories aren't reliable.
+3. **Scope 3**: biggest areas by activity and by labelled category; one line on why the labelled categories aren't reliable (use the caveat in the facts).
 4. **Key insights** (3-5 bullets): what matters most for reduction and for data quality.
 5. **Recommended next steps** (3-5, prioritised).
 Use a summary table for the scope totals. Be concise: one page.

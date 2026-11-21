@@ -91,7 +91,7 @@ def report_node(state: State) -> dict:
         "scope1_by_activity": analytics.breakdown(1, "activity_type"),
         "scope2_by_energy": analytics.breakdown(2, "energy_type"),
         "scope2_by_facility": analytics.breakdown(2, "facility"),
-        "scope3_reclassified": analytics.top_scope3("reclassified_category", 6),
+        "scope3_by_activity": analytics.top_scope3("activity", 6),
         "scope3_by_label": analytics.top_scope3("category", 3),
         "suppliers": analytics.supplier_priority()["suppliers"][:4],
         "quality": [{k: f[k] for k in ("id", "severity", "title")} for f in quality.run_quality_checks()["findings"]],

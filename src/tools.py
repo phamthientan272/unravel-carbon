@@ -37,11 +37,10 @@ def get_breakdown(scope: Literal["1", "2", "3"], by: str) -> str:
 
 
 @tool
-def get_top_scope3(by: Literal["category", "activity", "reclassified_category"] = "category", top_n: int = 5) -> str:
+def get_top_scope3(by: Literal["category", "activity"] = "category", top_n: int = 5) -> str:
     """Rank Scope 3 emissions, with the top activities and suppliers inside each group.
-    by='category' uses the category labels in the data (92% are inconsistent with the activity);
-    by='activity' ranks activity descriptions; by='reclassified_category' maps activities to the GHG Protocol category
-    inferred for them (LLM-inferred mapping, unverified: indicative only). For 'highest category' questions, call it with 'category' AND 'reclassified_category'."""
+    by='category' uses the category labels in the data (they can be inconsistent with the activity: read the caveat in the result);
+    by='activity' ranks activity descriptions. For 'highest category' questions, call it with 'category' AND 'activity'."""
     return _json(analytics.top_scope3(by, top_n))
 
 

@@ -23,8 +23,6 @@ def test_annualisation_only_applies_to_scope_1_and_2():
 def test_top_scope3_views():
     assert analytics.top_scope3("category", 1)["top"][0]["category_num"] == 3
     assert analytics.top_scope3("activity", 1)["top"][0]["activity_description"] == "Business Travel - Air"
-    top = analytics.top_scope3("reclassified_category", 1)["top"][0]
-    assert top["inferred_category_num"] == 1 and top["co2e_tonnes"] == pytest.approx(133282.7, abs=0.1)
 
 
 def test_supplier_priority_covers_all_suppliers():
@@ -108,13 +106,14 @@ def test_retrieval_uses_only_the_ghg_document_and_links_passages_to_findings():
     assert all(links[f["id"]] for f in findings) and links["QUESTION"]
 
 
-def test_reclassified_view_and_supplier_ranking_are_caveated():
-    assert "LLM-inferred" in analytics.top_scope3("reclassified_category", 1)["caveat"]
+def test_label_ranking_is_caveated_by_a_statistical_test_not_a_mapping():
+    caveat = analytics.top_scope3("category", 1)["caveat"]
+    assert "almost no information" in caveat and "unreliable" in caveat
+    assert analytics.top_scope3("activity", 1)["caveat"] is None
+
+
+def test_supplier_ranking_is_caveated():
     assert "indicative" in analytics.supplier_priority()["intensity_caveat"]
-
-
-def test_category_mismatch_rate():
-    assert get_inventory().scope3.category_mismatch.mean() == pytest.approx(0.92, abs=0.01)
 
 
 def test_calculate_is_exact_and_refuses_anything_but_arithmetic():
