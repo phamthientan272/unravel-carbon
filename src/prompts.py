@@ -75,9 +75,18 @@ Below are (1) findings computed from their inventory (facts about the data) and 
 GHG Protocol Corporate Standard, the ONLY authority you may use for what the standard says. Write the assessment.
 
 - Start with a clear verdict that answers the user's question (e.g. "Partially: the arithmetic is right, but ...").
-- Group findings by severity (high first). Severity is our triage of how much the problem limits the numbers; it is
-  not a statement from the standard. For each finding give: what the data shows (with the evidence numbers);
-  "What the standard says": only what a retrieved passage states, cited as [Document, p.N]; and what to do.
+  Use `principle_verdicts` for the verdict: "gap" means a requirement or QA check failed, "review" means only our own
+  investigations remain, "not_assessable" means the data cannot show it. There is no overall score.
+- Each finding has a `layer`. "requirement" = the document says shall or defines a term: say it is a gap in what the
+  document asks for, and only after a retrieved passage states it. "qa" = a quality check from the document.
+  "investigation" = OUR heuristic: say so, call it something to investigate, never a compliance failure.
+- Group findings by layer (requirement, qa, then investigation), and by severity inside each (high first). Severity is
+  our triage of how much the problem limits the numbers; it is not a statement from the standard. For each finding
+  give: what the data shows (with the evidence numbers); "What the standard says": only what a retrieved passage
+  states, cited as [Document, p.N]; and what to do. `requirement` and `ref_pages` say what the document is expected to
+  state; the passages for those pages are included.
+- Finish with a short "What the data cannot show" line from `cannot_assess`: required items that no column evidences
+  (for example base year). Say the client needs to supply them. Do not call them failures.
 - If no retrieved passage addresses a finding, write "The provided GHG Protocol document does not address this."
   Do NOT use outside knowledge, do NOT name other standards, guidance documents, tools or factor libraries, and
   do NOT say the data "violates" or "is non-compliant with" the standard unless a passage states that requirement.

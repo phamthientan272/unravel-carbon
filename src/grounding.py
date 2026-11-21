@@ -76,21 +76,27 @@ def retrieve_for_findings(plan: QueryPlan, findings: list[dict], k: int = 3) -> 
     """Search the GHG Protocol document for every planned query. Returns {finding_id: [passage ids]} and the passages."""
     kb, passages, index = get_kb(), [], {}
 
-    def fetch(queries: list[str]) -> list[str]:
+    def add(h: dict, ids: list[str]) -> None:
+        key = (h["page"], h["text"][:60])
+        if key not in index:
+            index[key] = f"P{len(index) + 1}"
+            passages.append({"id": index[key], "cite": f"[{h['title']}, p.{h['page']}]", "page": int(h["page"]), "text": h["text"]})
+        if index[key] not in ids:
+            ids.append(index[key])
+
+    def fetch(queries: list[str], pages: list[int] | None = None) -> list[str]:
         ids: list[str] = []
+        for p in (pages or [])[:2]:  # pages the catalog says state the requirement: always retrieved, so they can be cited
+            for h in kb.page(GHG_DOC, p):
+                add(h, ids)
         for q in queries[:2]:
             for h in kb.search(q, k=k, source=GHG_DOC):
-                key = (h["page"], h["text"][:60])
-                if key not in index:
-                    index[key] = f"P{len(index) + 1}"
-                    passages.append({"id": index[key], "cite": f"[{h['title']}, p.{h['page']}]", "page": int(h["page"]), "text": h["text"]})
-                if index[key] not in ids:
-                    ids.append(index[key])
+                add(h, ids)
         return ids
 
     wanted = {f["id"] for f in findings}
     by_id = {it.finding_id: it.queries for it in plan.items if it.finding_id in wanted}
-    links = {f["id"]: fetch(by_id.get(f["id"]) or [f["fallback_query"]]) for f in findings}
+    links = {f["id"]: fetch(by_id.get(f["id"]) or [f["fallback_query"]], f.get("ref_pages")) for f in findings}
     links["QUESTION"] = fetch(plan.question_queries)
     return links, passages
 
@@ -101,7 +107,10 @@ def build_quality_package(question: str, scope: str = "all", max_findings: int =
     `text_chars` shortens each passage (the agent tool uses it to keep the tool result small).
     """
     result = run_quality_checks(scope)
-    important = [f for f in result["findings"] if f["severity"] in ("high", "medium")][:max_findings]
+    # requirement and qa findings first: those are the ones the document speaks to
+    open_ = [f for f in result["findings"] if f["severity"] in ("high", "medium")]
+    open_.sort(key=lambda f: f["layer"] == "investigation")
+    important = open_[:max_findings]
     plan = plan_queries(question, important)
     links, passages = retrieve_for_findings(plan, important)
     findings = [
@@ -115,7 +124,8 @@ def build_quality_package(question: str, scope: str = "all", max_findings: int =
     notes.append(f"queries[question]: {' | '.join(plan.question_queries)}")
     notes.append(f"retrieved {len(passages)} passages, pages {sorted({p['page'] for p in passages})}")
     return {
-        "scope": scope, "severity_counts": result["severity_counts"], "findings": findings,
+        "scope": scope, "severity_counts": result["severity_counts"], "open_by_layer": result["open_by_layer"],
+        "principle_verdicts": result["principle_verdicts"], "cannot_assess": result["cannot_assess"], "findings": findings,
         "passage_ids_for_the_question": links["QUESTION"], "passages": passages, "notes": notes,
     }
 

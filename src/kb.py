@@ -133,6 +133,14 @@ class KnowledgeBase:
                  "score": round(fused[c], 4), "text": self.docs[c]} for c in top]
 
 
+    def page(self, source: str, page: int, max_chunks: int = 1) -> list[dict]:
+        """The first chunk(s) of one page, for citing a page the quality catalog points to."""
+        ids = [i for i in self.ids if self.meta[i]["source"] == source and self.meta[i]["page"] == page]
+        ids.sort(key=lambda i: int(i.rsplit(":", 1)[1]))
+        return [{"source": source, "title": self.meta[i]["title"], "page": page, "score": 1.0, "text": self.docs[i]}
+                for i in ids[:max_chunks]]
+
+
 @lru_cache(maxsize=1)
 def get_kb() -> KnowledgeBase:
     return KnowledgeBase()

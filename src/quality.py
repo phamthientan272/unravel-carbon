@@ -8,13 +8,21 @@ Design
   reported tonnes, site, source, ...). A new company needs a new spec (the LLM can propose one, a person confirms).
   Rules whose input column is missing are skipped, not guessed.
 - **Rules establish facts, the document supplies the standard.** Every finding's evidence is computed from the
-  data. What the GHG Protocol says about it is NOT stored here: the provided document is the only authority and it
-  is searched when a question is asked, with queries the LLM writes from the question and the finding (src/graph.py).
-  `quality_catalog.yaml` holds only neutral titles and a fallback search query.
+  data. The wording of what the GHG Protocol says is NOT stored here: the provided document is the only authority and
+  it is searched when a question is asked (src/grounding.py). `quality_catalog.yaml` holds each rule's layer, the
+  principle it serves, a neutral statement of the requirement and the PDF pages where the document states it.
 - **The LLM never invents findings.** It explains and prioritises them, citing only retrieved passages.
 
+Three layers, so a reader knows how much weight a finding carries (see the catalog header):
+- `requirement`: the document says "shall" or defines a term the data must respect. A gap here is a compliance gap.
+- `qa`: a chapter 7 quality check, or a direct consequence of a principle.
+- `investigation`: our own heuristic or statistical test. Never a compliance claim.
+
+The result also gives a verdict per principle (chapter 1) and a list of requirements the data cannot show.
+The document warns that uncertainty is not an objective quality measure (PDF p.58), so there is no single score.
+
 Every finding also states its `dimension` (what kind of quality problem) and `basis` (how it was established:
-`data`, `statistical` or `heuristic`), so a reader knows how much to trust it.
+`data`, `statistical` or `heuristic`).
 """
 
 from __future__ import annotations
@@ -34,12 +42,6 @@ from src.data import Inventory, get_inventory
 Severity = Literal["high", "medium", "low", "pass"]
 SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2, "pass": 3}
 CATALOG_PATH = Path(__file__).with_name("quality_catalog.yaml")
-
-# An association counts as informative only if it is statistically detectable AND the effect is not tiny.
-MIN_EXCESS_V = 0.3
-ALPHA = 0.05
-DOMINANT_SOURCE_SHARE = 0.20  # a source carrying at least this share of a scope's tonnes
-CONCENTRATION_SHARE = 0.50  # one entity carrying at least this share of a scope's tonnes
 
 
 # --- column spec: the only place that knows a company's column names ----------------------------
@@ -94,8 +96,12 @@ class Finding:
     title: str
     evidence: str
     fallback_query: str = ""  # used to search the document only if the LLM cannot write a query
-    dimension: str = ""  # consistency | completeness | compliance | plausibility | traceability | insight
+    dimension: str = ""  # consistency | completeness | plausibility | traceability | insight
     basis: str = ""      # data | statistical | heuristic
+    layer: str = ""      # requirement | qa | investigation
+    principle: str = ""  # relevance | completeness | consistency | transparency | accuracy
+    requirement: str = ""  # what the document asks for (empty for investigations)
+    ref_pages: list[int] = field(default_factory=list)  # PDF pages where the document states it
     headline: str = ""   # first sentence of the evidence, for compact summaries
     impact_tco2e: float | None = None
     extra: dict = field(default_factory=dict)
@@ -114,6 +120,7 @@ def _finding(rule: str, fid: str, scopes: str, severity: Severity, evidence: str
     return Finding(
         id=fid, scope=scopes, severity=severity, title=c["title"].format(**fmt), evidence=evidence,
         fallback_query=c["fallback_query"], dimension=c["dimension"], basis=c["basis"], headline=first[:300],
+        layer=c["layer"], principle=c["principle"], requirement=c["requirement"], ref_pages=list(c["pages"]),
         impact_tco2e=None if impact is None else round(float(impact), 1),
     )
 
@@ -166,7 +173,7 @@ def association(a: pd.Series, b: pd.Series, perms: int = 1000, seed: int = 0) ->
     chance = v(null.mean())
     excess = (v(obs) - chance) / (1 - chance) if chance < 1 else 0.0
     p = (1 + int((null >= obs).sum())) / (perms + 1)
-    return {"excess_v": round(max(excess, 0.0), 3), "p": round(p, 3), "informative": bool(p < ALPHA and excess >= MIN_EXCESS_V)}
+    return {"excess_v": round(max(excess, 0.0), 3), "p": round(p, 3), "informative": bool(p < 0.05 and excess >= 0.3)}
 
 
 # --- rules that run on any single scope table ---------------------------------------------------
@@ -191,7 +198,7 @@ def _single_factor(n: int, df: pd.DataFrame, spec: TableSpec) -> Finding | None:
     hits = []
     for source, g in df.groupby(src):
         share = g[spec.reported].sum() / total
-        if share >= DOMINANT_SOURCE_SHARE and site[g.index].nunique() > 1 and g[spec.factor].nunique() == 1:
+        if share >= 0.20 and site[g.index].nunique() > 1 and g[spec.factor].nunique() == 1:
             hits.append((source, g, share))
     if not hits:
         return None
@@ -211,7 +218,7 @@ def _concentration(n: int, df: pd.DataFrame, spec: TableSpec) -> Finding | None:
         return None
     by = df.groupby(ent)[spec.reported].sum().sort_values(ascending=False)
     share = by.iloc[0] / by.sum()
-    if share < CONCENTRATION_SHARE:
+    if share < 0.50:
         return None
     top = by.index[0]
     src = _col(df, spec.source)
@@ -365,6 +372,102 @@ def check_cross_scope(inv: Inventory, spec: QualitySpec = DEFAULT_SPEC) -> list[
     return out
 
 
+# --- requirement layer: items the document says "shall" ------------------------------------------
+
+GAS_COLUMN = re.compile(r"(^|[^a-z])(co2|ch4|n2o|hfcs?|pfcs?|sf6)([^a-z0-9e]|$)", re.I)  # "co2e" is not a gas column
+BIOGENIC_SOURCE = re.compile(r"biomass|biofuel|biodiesel|bioethanol|wood|pellet|bagasse|biogas", re.I)
+NON_ELECTRICITY = re.compile(r"steam|heat|cool|district|chilled", re.I)
+ELECTRICITY = re.compile(r"electric|power", re.I)
+
+
+def check_requirements(inv: Inventory, spec: QualitySpec = DEFAULT_SPEC) -> list[Finding]:
+    out: list[Finding] = []
+    tables = {1: (inv.scope1, spec.scope1), 2: (inv.scope2, spec.scope2), 3: (inv.scope3, spec.scope3)}
+
+    # Scopes 1 and 2 are kept apart: each has its own table with its own reported tonnes.
+    apart = all(s.reported in df.columns and len(df) for df, s in (tables[1], tables[2]))
+    out.append(_finding("REQ_SCOPES_APART", "REQ-SCOPES-SEPARATE", "1,2", "pass" if apart else "high",
+                        "Scope 1 and Scope 2 are held in separate tables, each with its own reported tonnes." if apart
+                        else "Scope 1 and Scope 2 are not both available as separate tables with reported tonnes."))
+
+    # Six gases reported separately, in tonnes and in tonnes CO2e.
+    gas_cols = {f"scope{n}": [c for c in df.columns if GAS_COLUMN.search(str(c))] for n, (df, _) in tables.items()}
+    if not any(gas_cols.values()):
+        ev = ("Every table gives one reported figure in tonnes CO2e. No column gives emissions per gas "
+              "(CO2, CH4, N2O, HFCs, PFCs, SF6), so the breakdown by gas cannot be shown from this data. "
+              "If the report holds it elsewhere, this is a gap in the data supplied, not necessarily in the report.")
+        out.append(_finding("REQ_GAS_BREAKDOWN", "ALL-GAS-BREAKDOWN", "all", "medium", ev))
+    else:
+        found = sorted({c.lower() for cols in gas_cols.values() for c in cols})
+        out.append(_finding("REQ_GAS_BREAKDOWN", "ALL-GAS-BREAKDOWN", "all", "pass",
+                            f"Gas-level columns are present ({', '.join(found)}). Whether all six gases are covered is not checked."))
+
+    # Biomass or biofuel burned must be reported separately from Scope 1.
+    s1, p1 = tables[1]
+    src1 = _col(s1, p1.source)
+    if src1 is not None:
+        bio = s1[src1.astype(str).str.contains(BIOGENIC_SOURCE)]
+        if len(bio):
+            names = ", ".join(sorted(src1[bio.index].astype(str).unique()))
+            out.append(_finding("REQ_BIOGENIC", "S1-BIOGENIC", "1", "medium",
+                                f"{len(bio)} Scope 1 rows ({bio[p1.reported].sum():,.0f} t) have a biomass or biofuel source ({names}). "
+                                "The data does not show whether their CO2 is excluded from Scope 1 and reported separately.",
+                                bio[p1.reported].sum()))
+        else:
+            out.append(_finding("REQ_BIOGENIC", "S1-BIOGENIC", "1", "pass",
+                                "No biomass or biofuel source was found in the Scope 1 source column (keyword match)."))
+
+    # Scope 2 is defined as purchased electricity.
+    s2, p2 = tables[2]
+    src2 = _col(s2, p2.source)
+    if src2 is not None:
+        other = s2[src2.astype(str).str.contains(NON_ELECTRICITY) & ~src2.astype(str).str.contains(ELECTRICITY)]
+        if len(other):
+            names = ", ".join(sorted(src2[other.index].astype(str).unique()))
+            t = other[p2.reported].sum()
+            out.append(_finding("REQ_SCOPE2_DEFINITION", "S2-DEFINITION", "2", "medium",
+                                f"{len(other)} of {len(s2)} Scope 2 rows ({t:,.0f} t) are for energy other than electricity ({names}). "
+                                "In the provided document Scope 2 covers purchased electricity only, so these rows need a scope decision.", t))
+    return out
+
+
+# What the data cannot show at all. Each item is a requirement of the document that no table column can evidence.
+def cannot_assess(inv: Inventory, spec: QualitySpec = DEFAULT_SPEC) -> list[dict]:
+    years = {int(y) for n, s in ((1, spec.scope1), (2, spec.scope2), (3, spec.scope3))
+             for y in pd.to_datetime(getattr(inv, f"scope{n}")[s.date]).dt.year.unique()}
+    items = [
+        {"item": "Base year and base-year recalculation policy", "needs": "a base year, its reason and a recalculation policy", "pages": [37, 65]},
+        {"item": "Organizational boundary and consolidation approach", "needs": "the chosen approach (equity share or control)", "pages": [65]},
+        {"item": "Methodologies and exclusions disclosed", "needs": "a methodology statement and a list of excluded sources", "pages": [65]},
+        {"item": "Scope 2 emission factor basis", "needs": "whether factors are at generation or at consumption", "pages": [89]},
+        {"item": "Relevance to the users' decisions", "needs": "the purpose of the inventory and its users", "pages": [10]},
+    ]
+    if len(years) < 2:
+        items.append({"item": "Year-on-year change in activity data", "pages": [55],
+                      "needs": f"data for at least two years (only {sorted(years)} present)"})
+    return items
+
+
+PRINCIPLES = ("relevance", "completeness", "consistency", "transparency", "accuracy")
+
+
+def principle_verdicts(findings: list[Finding]) -> dict:
+    """One verdict per principle. Investigations alone never make a gap: they say 'review'.
+
+    gap = a requirement or QA check failed (high or medium); review = only investigations or low-severity items;
+    no_issues_found = checks ran and passed; not_assessable = no check in this module covers the principle.
+    """
+    out = {}
+    for p in PRINCIPLES:
+        fs = [f for f in findings if f.principle == p]
+        failed = [f for f in fs if f.layer in ("requirement", "qa") and f.severity in ("high", "medium")]
+        review = [f for f in fs if f.severity != "pass" and f not in failed]
+        status = "gap" if failed else "review" if review else "no_issues_found" if fs else "not_assessable"
+        out[p] = {"status": status, "gaps": [f.id for f in failed], "to_review": [f.id for f in review],
+                  "checks_passed": [f.id for f in fs if f.severity == "pass"]}
+    return out
+
+
 def check_scope1(inv: Inventory, spec: QualitySpec = DEFAULT_SPEC) -> list[Finding]:
     return _table_checks(1, inv.scope1, spec.scope1)
 
@@ -386,11 +489,19 @@ def _table_checks(n: int, df: pd.DataFrame, spec: TableSpec) -> list[Finding]:
 
 
 def run_quality_checks(scope: str = "all", inv: Inventory | None = None, spec: QualitySpec | None = None) -> dict:
-    """Run all checks, optionally filtered to one scope ('1', '2', '3' or 'all')."""
+    """Run all checks, optionally filtered to one scope ('1', '2', '3' or 'all').
+
+    Returns the findings (requirement, qa and investigation layers), a verdict per principle and the list of
+    requirements the data cannot show.
+    """
     inv, spec = inv or get_inventory(), spec or DEFAULT_SPEC
-    findings = check_cross_scope(inv, spec) + check_scope1(inv, spec) + check_scope2(inv, spec) + check_scope3(inv, spec)
+    findings = (check_requirements(inv, spec) + check_cross_scope(inv, spec) + check_scope1(inv, spec)
+                + check_scope2(inv, spec) + check_scope3(inv, spec))
     if scope != "all":
         findings = [f for f in findings if scope in f.scope.split(",") or f.scope == "all"]
     findings.sort(key=lambda f: (SEVERITY_ORDER[f.severity], -(f.impact_tco2e or 0)))
     counts = {s: sum(f.severity == s for f in findings) for s in SEVERITY_ORDER}
-    return {"scope": scope, "severity_counts": counts, "findings": [asdict(f) for f in findings]}
+    layers = {l: sum(f.layer == l and f.severity != "pass" for f in findings) for l in ("requirement", "qa", "investigation")}
+    return {"scope": scope, "severity_counts": counts, "open_by_layer": layers,
+            "principle_verdicts": principle_verdicts(findings), "cannot_assess": cannot_assess(inv, spec),
+            "findings": [asdict(f) for f in findings]}

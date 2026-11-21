@@ -1,96 +1,203 @@
 # Catalog for the quality rules in src/quality.py.
 #
 # GROUNDING RULE: the only authority on what the GHG Protocol says is the provided document
-# (data/ghg-protocol-revised.pdf). Nothing in this file states what the standard requires, and no outside
-# standard, tool or factor library is named. The rules in code establish FACTS about the data and compute the
-# evidence. What the standard says about each fact is retrieved from the document when a question is asked,
-# using queries the LLM writes from the user's question and the finding (see quality_node in src/graph.py).
+# (data/ghg-protocol-revised.pdf). No outside standard, tool or factor library is named. The rules in code
+# establish FACTS about the data and compute the evidence. Each entry below says where the rule's authority comes from.
 #
+# - layer: how much weight the rule carries
+#     requirement   = the document says "shall" (a mandatory item), or defines a term the data must respect
+#     qa            = a quality check the document lists in chapter 7 ("should"), or follows directly from a principle
+#     investigation = our own heuristic or statistical test. The document does not ask for it. Never a compliance claim.
+# - principle: relevance | completeness | consistency | transparency | accuracy (chapter 1, PDF p.9)
+# - requirement: what the document asks for, in neutral words (empty for investigations)
+# - pages: PDF pages (printed page + 2) where the document states it. Retrieved and shown next to the finding.
 # - title: neutral description of what the data shows (not a compliance claim).
 # - dimension: consistency | completeness | traceability | plausibility | insight
 # - basis: data (computed from the file) | statistical (computed test) | heuristic (keyword or rule of thumb)
 # - fallback_query: used to search the document only if the LLM cannot write a query.
 # Severity is our triage of how much the data problem limits use of the numbers. It is not from the standard.
 
+# --- requirement layer -----------------------------------------------------------------------------------------
+
+REQ_SCOPES_APART:
+  layer: requirement
+  principle: completeness
+  requirement: "Account for and report Scope 1 and Scope 2 separately, at a minimum."
+  pages: [27]
+  title: "Scope 1 and Scope 2 are reported separately"
+  dimension: completeness
+  basis: data
+  fallback_query: "account for and report scopes 1 and 2 separately at a minimum"
+
+REQ_GAS_BREAKDOWN:
+  layer: requirement
+  principle: completeness
+  requirement: "Report emissions data for each of the six GHGs separately, in metric tonnes and in tonnes of CO2 equivalent."
+  pages: [65]
+  title: "Emissions are not broken down by gas"
+  dimension: completeness
+  basis: data
+  fallback_query: "emissions data for all six GHGs separately in metric tonnes and tonnes of CO2 equivalent"
+
+REQ_BIOGENIC:
+  layer: requirement
+  principle: completeness
+  requirement: "Direct CO2 from burning biomass or biofuels is not included in Scope 1 and is reported separately."
+  pages: [27, 65]
+  title: "Biomass or biofuel sources in Scope 1"
+  dimension: completeness
+  basis: heuristic
+  fallback_query: "direct CO2 emissions from combustion of biomass shall not be included in scope 1"
+
+REQ_SCOPE2_DEFINITION:
+  layer: requirement
+  principle: consistency
+  requirement: "Scope 2 accounts for emissions from the generation of purchased electricity consumed by the company."
+  pages: [27]
+  title: "Scope 2 table holds energy other than electricity"
+  dimension: consistency
+  basis: heuristic
+  fallback_query: "scope 2 electricity indirect emissions purchased electricity definition"
+
+# --- qa layer (chapter 7 checks and direct consequences of a principle) -----------------------------------------
+
 PERIOD:
+  layer: qa
+  principle: consistency
+  requirement: "Aggregate information is compiled so that it is internally consistent. The reporting period is stated."
+  pages: [10, 65]
   title: "Reporting periods differ across scopes"
   dimension: completeness
   basis: data
   fallback_query: "reporting period annual inventory"
 
 COMPLETENESS:
+  layer: qa
+  principle: completeness
+  requirement: "Check input data for errors, and check the aggregation of data across source categories."
+  pages: [10, 53]
   title: "Missing values, duplicate rows or constant columns"
   dimension: completeness
   basis: data
   fallback_query: "completeness principle accounting reporting"
 
 RECALC:
+  layer: qa
+  principle: accuracy
+  requirement: "Check that units are labelled and carried through, and check a representative sample of calculations."
+  pages: [53]
   title: "Scope {scope}: reported tonnes versus amount x factor"
   dimension: consistency
   basis: data
   fallback_query: "calculation of emissions activity data emission factors"
 
 FACTOR_META:
+  layer: qa
+  principle: transparency
+  requirement: "Document references and assumptions for emission factors so a third party can derive the same result."
+  pages: [11, 53, 55]
   title: "Emission-factor unit, source or year not recorded"
   dimension: traceability
   basis: data
   fallback_query: "transparency documentation of emission factors and assumptions"
 
+SINGLE_FACTOR:
+  layer: qa
+  principle: accuracy
+  requirement: "Assess whether emission factors are representative and applicable. Site-specific factors are preferable to generic ones."
+  pages: [44, 55, 89]
+  title: "A dominant source uses one factor across different sites"
+  dimension: plausibility
+  basis: data
+  fallback_query: "emission factors site specific data quality"
+
+# --- investigation layer (our heuristics) ------------------------------------------------------------------------
+
 RENEW_UNSUPPORTED:
+  layer: investigation
+  principle: transparency
+  requirement: ""
+  pages: []
   title: "A renewable share is recorded without any record of the instrument behind it"
   dimension: traceability
   basis: data
   fallback_query: "green power purchases renewable energy certificates reporting"
 
 FACTOR_IGNORES_ATTRIBUTE:
+  layer: investigation
+  principle: accuracy
+  requirement: ""
+  pages: []
   title: "A recorded attribute (renewable share) never changes the emission factor"
   dimension: consistency
   basis: data
   fallback_query: "green power purchases reporting electricity emissions"
 
-SINGLE_FACTOR:
-  title: "A dominant source uses one factor across different sites"
-  dimension: plausibility
-  basis: data
-  fallback_query: "emission factors site specific data quality"
-
 HEAT_OVERLAP:
+  layer: investigation
+  principle: consistency
+  requirement: ""
+  pages: [48, 67]
   title: "Fuel burned on site (Scope 1) and heat or steam bought at the same site (Scope 2)"
   dimension: consistency
   basis: heuristic
   fallback_query: "double counting scope 1 scope 2 purchased steam heat"
 
 CONCENTRATION:
+  layer: investigation
+  principle: accuracy
+  requirement: ""
+  pages: [51]
   title: "Scope {scope} emissions are concentrated in one entity"
   dimension: insight
   basis: data
   fallback_query: "inventory quality management priorities data collection"
 
 LABEL_NO_INFO:
+  layer: investigation
+  principle: accuracy
+  requirement: ""
+  pages: []
   title: "Scope 3 category labels carry no information about the activity"
   dimension: plausibility
   basis: statistical
   fallback_query: "scope 3 other indirect emissions categories activities"
 
 SUPPLIER_NO_INFO:
+  layer: investigation
+  principle: accuracy
+  requirement: ""
+  pages: []
   title: "Suppliers do not match the activities they are recorded against"
   dimension: plausibility
   basis: statistical
   fallback_query: "inventory quality management data collection checks"
 
 FACTOR_NOT_DISCRIMINATING:
+  layer: investigation
+  principle: accuracy
+  requirement: ""
+  pages: [55]
   title: "Spend-based factors do not differ by activity"
   dimension: plausibility
   basis: statistical
   fallback_query: "uncertainty emission factors data quality"
 
 SPEND_ONLY:
+  layer: investigation
+  principle: accuracy
+  requirement: ""
+  pages: []
   title: "All Scope 3 rows are calculated as spend x factor"
   dimension: plausibility
   basis: data
   fallback_query: "scope 3 calculation methods data quality uncertainty"
 
 DQ_LABELS:
+  layer: investigation
+  principle: transparency
+  requirement: ""
+  pages: []
   title: "Data-quality labels are uninformative or contradictory"
   dimension: traceability
   basis: heuristic

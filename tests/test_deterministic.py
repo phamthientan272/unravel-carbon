@@ -278,3 +278,72 @@ def test_llm_configuration_errors_say_how_to_fix_them(clean_llm_env):
         get_llm()
     except LLMConfigError as e:  # package not installed here: the message must name it
         assert "langchain-ollama" in str(e)
+
+
+# --- layers, requirements and principle verdicts -------------------------------------------------------
+
+def test_every_finding_has_layer_principle_and_pages_for_requirements():
+    for f in run_quality_checks()["findings"]:
+        assert f["layer"] in ("requirement", "qa", "investigation")
+        assert f["principle"] in ("relevance", "completeness", "consistency", "transparency", "accuracy")
+        if f["layer"] == "requirement":
+            assert f["requirement"] and f["ref_pages"]
+        if f["layer"] == "investigation":
+            assert f["requirement"] == ""
+
+
+def test_requirement_checks_on_the_sample_data():
+    ids = {f["id"]: f for f in run_quality_checks()["findings"]}
+    assert ids["REQ-SCOPES-SEPARATE"]["severity"] == "pass"
+    assert ids["ALL-GAS-BREAKDOWN"]["severity"] == "medium" and "per gas" in ids["ALL-GAS-BREAKDOWN"]["evidence"]
+    assert ids["S1-BIOGENIC"]["severity"] == "pass"
+    assert ids["S2-DEFINITION"]["severity"] == "medium" and "Steam" in ids["S2-DEFINITION"]["evidence"]
+
+
+def test_investigations_alone_never_make_a_gap():
+    from src.quality import Finding, principle_verdicts
+
+    inv = Finding(id="X", scope="3", severity="high", title="t", evidence="e", layer="investigation", principle="accuracy")
+    qa = Finding(id="Y", scope="1", severity="medium", title="t", evidence="e", layer="qa", principle="completeness")
+    ok = Finding(id="Z", scope="1", severity="pass", title="t", evidence="e", layer="qa", principle="consistency")
+    v = principle_verdicts([inv, qa, ok])
+    assert v["accuracy"]["status"] == "review"           # only an investigation is open
+    assert v["completeness"]["status"] == "gap"          # a qa check failed
+    assert v["consistency"]["status"] == "no_issues_found"
+    assert v["relevance"]["status"] == "not_assessable"  # nothing checks it
+
+
+def test_result_lists_what_the_data_cannot_show():
+    r = run_quality_checks()
+    items = " ".join(c["item"] for c in r["cannot_assess"])
+    assert "Base year" in items and "Year-on-year" in items   # sample data covers one year only
+    assert set(r["principle_verdicts"]) == {"relevance", "completeness", "consistency", "transparency", "accuracy"}
+    assert r["principle_verdicts"]["completeness"]["status"] == "gap"   # gas breakdown missing
+
+
+def test_new_company_gets_biogenic_and_gas_checks_without_hardcoded_names():
+    import pandas as pd
+    from src.quality import QualitySpec, TableSpec
+
+    inv = _new_company_inventory()
+    inv.scope1.loc[0, "fuel"] = "Wood pellets"
+    inv.scope1["co2_t"] = 1.0   # a per-gas column exists
+    spec = QualitySpec(
+        scope1=TableSpec(amount="qty", factor="ef", reported="tco2e", entity="site", site="site", source="fuel"),
+        scope2=TableSpec(amount="qty", factor="ef", reported="tco2e", entity="site", site="site", source="fuel"),
+        scope3=TableSpec(amount="spend", factor="ef", reported="tco2e", entity="vendor", source="activity",
+                         method="spend", category="cat", supplier="vendor"),
+    )
+    ids = {f["id"]: f for f in run_quality_checks("all", inv=inv, spec=spec)["findings"]}
+    assert ids["S1-BIOGENIC"]["severity"] == "medium" and "Wood pellets" in ids["S1-BIOGENIC"]["evidence"]
+    assert ids["ALL-GAS-BREAKDOWN"]["severity"] == "pass"
+    assert ids["S2-DEFINITION"]["severity"] == "medium"   # heat in the scope 2 table
+
+
+def test_requirement_pages_are_retrieved_so_they_can_be_cited():
+    from src import grounding
+
+    findings = [f for f in run_quality_checks()["findings"] if f["id"] == "ALL-GAS-BREAKDOWN"]
+    plan = grounding.QueryPlan(items=[], question_queries=[])
+    links, passages = grounding.retrieve_for_findings(plan, findings)
+    assert 65 in {p["page"] for p in passages} and links["ALL-GAS-BREAKDOWN"]
