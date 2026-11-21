@@ -33,7 +33,7 @@ def get_breakdown(scope: Literal["1", "2", "3"], by: str) -> str:
     scope1 columns: facility, activity_type, fuel_type, month.
     scope2 columns: facility, energy_type, grid_region, month.
     scope3 columns: supplier, activity_description, category, data_quality, month, quarter."""
-    return _json(analytics.breakdown(int(scope), by))  # Gemini schemas only allow string enums
+    return _json(analytics.breakdown(int(scope), by))  # string enum: every provider's tool schema supports it
 
 
 @tool

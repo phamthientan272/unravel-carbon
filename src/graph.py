@@ -26,7 +26,7 @@ from pydantic import BaseModel, Field
 from src import analytics, benchmark, quality
 from src.data import ROOT, data_card
 from src.grounding import build_quality_package, format_passages, pages_in, strip_unverified_citations
-from src.llm import get_llm, text_of
+from src.llm import describe_llm, get_llm, text_of
 from src.prompts import QUALITY_PROMPT, REPORT_PROMPT, ROUTER_PROMPT, SYSTEM_PROMPT
 from src.tools import ALL_TOOLS
 
@@ -145,7 +145,7 @@ def build_graph(checkpointer=None):
 def ask(graph, question: str, thread_id: str = "cli") -> dict:
     """Run one turn. Returns the answer text, the intent, and a trace of tool calls."""
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 25}
-    trace, intent, answer = [], None, ""
+    trace, intent, answer = [{"step": "llm", "detail": describe_llm()}], None, ""
     for update in graph.stream({"messages": [HumanMessage(question)]}, config, stream_mode="updates"):
         for node, delta in update.items():
             if node == "router":
