@@ -23,7 +23,8 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 from pydantic import BaseModel, Field
 
-from src import analytics, quality
+from src import analytics, audit, quality
+from src.audit import TraceRecorder
 from src.data import ROOT, data_card
 from src.grounding import build_quality_package, format_passages, pages_in, strip_unverified_citations
 from src.llm import describe_llm, get_llm, text_of
@@ -145,25 +146,58 @@ def ask(graph, question: str, thread_id: str = "cli") -> dict:
     """Run one turn. Returns the answer text, the intent, and a trace of tool calls."""
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 25}
     trace, intent, answer = [{"step": "llm", "detail": describe_llm()}], None, ""
-    for update in graph.stream({"messages": [HumanMessage(question)]}, config, stream_mode="updates"):
-        for node, delta in update.items():
-            if node == "router":
-                intent = delta["intent"]
-                trace.append({"step": "router", "detail": f"intent={delta['intent']}, scope={delta['scope']}"
-                                                  + (", low confidence -> agent" if delta.get("low_confidence") else "")})
-                continue
-            for note in (delta or {}).get("notes", []):
-                trace.append({"step": "retrieval", "detail": note})
-            for m in (delta or {}).get("messages", []):
-                if isinstance(m, AIMessage) and m.tool_calls:
-                    for tc in m.tool_calls:
-                        trace.append({"step": "tool_call", "detail": f"{tc['name']}({json.dumps(tc['args'])})"})
-                elif m.type == "tool":
-                    trace.append({"step": "tool_result", "detail": f"{m.name}: {text_of(m)[:300]}"})
-                elif isinstance(m, AIMessage):
-                    answer = text_of(m)
-                    trace.append({"step": node, "detail": "answer generated"})
-    return {"answer": answer, "intent": intent, "trace": trace}
+    rec = TraceRecorder(question, thread_id, describe_llm()) if audit.enabled() else None
+    pages: set[int] = set()
+    error: BaseException | None = None
+    try:
+        for update in graph.stream({"messages": [HumanMessage(question)]}, config, stream_mode="updates"):
+            for node, delta in update.items():
+                delta = delta or {}
+                if node == "router":
+                    intent = delta["intent"]
+                    trace.append({"step": "router", "detail": f"intent={delta['intent']}, scope={delta['scope']}"
+                                                      + (", low confidence -> agent" if delta.get("low_confidence") else "")})
+                    if rec:
+                        rec.record.update(intent=delta["intent"], scope=delta["scope"], low_confidence=delta["low_confidence"])
+                        rec.event("router", intent=delta["intent"], scope=delta["scope"], low_confidence=delta["low_confidence"],
+                                  next_node=route_next({**delta, "messages": []}))
+                    continue
+                pages |= set(delta.get("pages") or [])
+                for note in delta.get("notes", []):
+                    trace.append({"step": "retrieval", "detail": note})
+                    if rec:
+                        rec.event("note", node=node, detail=note)
+                for m in delta.get("messages", []):
+                    if isinstance(m, AIMessage) and m.tool_calls:
+                        for tc in m.tool_calls:
+                            trace.append({"step": "tool_call", "detail": f"{tc['name']}({json.dumps(tc['args'])})"})
+                        if rec:
+                            rec.add_usage(m.usage_metadata)
+                            rec.event("tool_calls", node=node, content=text_of(m),
+                                      calls=[{"tool_call_id": tc["id"], "tool": tc["name"], "args": tc["args"]} for tc in m.tool_calls])
+                    elif m.type == "tool":
+                        trace.append({"step": "tool_result", "detail": f"{m.name}: {text_of(m)[:300]}"})
+                        if rec:
+                            rec.event("tool_result", node=node, tool=m.name, tool_call_id=m.tool_call_id,
+                                      status=getattr(m, "status", None), result=text_of(m))
+                    elif isinstance(m, AIMessage):
+                        answer = text_of(m)
+                        trace.append({"step": node, "detail": "answer generated"})
+                        if rec:
+                            rec.add_usage(m.usage_metadata)
+                            rec.event("answer", node=node, answer=answer)
+    except BaseException as e:
+        error = e
+        raise
+    finally:
+        if rec:
+            rec.record["pages_retrieved"] = sorted(pages)
+            path = rec.finish(answer, error)
+            trace_id, trace_path = rec.record["trace_id"], str(path) if path else None
+    out = {"answer": answer, "intent": intent, "trace": trace}
+    if rec:
+        out |= {"trace_id": trace_id, "trace_path": trace_path}
+    return out
 
 
 if __name__ == "__main__":
@@ -173,3 +207,5 @@ if __name__ == "__main__":
     out = ask(graph, " ".join(sys.argv[1:]) or "What were our highest Scope 3 emissions categories?")
     print("\n".join(f"  · {t['step']}: {t['detail']}" for t in out["trace"]))
     print("\n" + out["answer"])
+    if out.get("trace_path"):
+        print(f"\nAudit trace: {out['trace_path']}")
