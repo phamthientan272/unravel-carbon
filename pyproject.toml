@@ -1,0 +1,41 @@
+[project]
+name = "emissions-agent"
+version = "0.1.0"
+description = "Emissions Analysis & Insights Agent (Unravel Carbon take-home)"
+requires-python = ">=3.12"
+dependencies = [
+    "pandas",
+    "duckdb",
+    "pypdf",
+    "pymupdf",
+    "chromadb",
+    "rank-bm25",
+    "langgraph",
+    "langchain-core",
+    "langchain-google-genai",
+    "streamlit",
+    "plotly",
+    "python-dotenv",
+    "pyyaml",
+    "ocrmac>=1.0.1 ; sys_platform == 'darwin'",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.4.0",
+    "matplotlib>=3.11.2",
+    "nbconvert>=7.17.2",
+    "nbformat>=5.11.1",
+    "pytest",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.coverage.run]
+source = ["src"]
+
+[tool.coverage.report]
+show_missing = true
+exclude_also = ["if __name__ == .__main__.:"]  # CLI entry points: run by hand, not unit-testable
